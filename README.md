@@ -145,6 +145,16 @@ Honest boundaries, not roadmap promises:
   smart constructors in ordinary Nim code, not through MetaOCaml-style
   brackets and escape. A macro layer is out of scope for v0.1.0.
 
+## Direction
+
+The boundary above is the v0.1.0 state, not a permanent one. This
+library is expected to grow facilities targeted specifically at
+supporting the relational engine — the staged-relational client above
+is its motivating application — and the engine
+([raven6941/minikanren](https://github.com/raven6941/minikanren)) may
+eventually depend on this library. For now the engine stands alone
+with no staging dependency, and the relational client stays in Eponym.
+
 ## License
 
 MIT — see LICENSE.
