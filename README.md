@@ -35,7 +35,7 @@ no optimization passes — except one, `genlet`.
 |---|---|
 | `staging/framework` | `Rep[T]`, `IRNode`, `lift`, `dynamic`, `smartOp` / `smartOpUni`, tagless-final hook. No imports at all. |
 | `staging/csp` | Cross-stage persistence registry: declare every present-stage name the residual may reference, emit it only via `lift`, derive the residual's import block from the registry. No imports at all. |
-| `staging/genlet` | Residual let-insertion over a generic tree (`GTree`): common-subterm elimination with residual `let` binders, gated by a node-savings test. Stdlib only (`tables`, `sequtils`, `strutils`). |
+| `staging/genlet` | Residual let-insertion over `GTree`, or directly over a client IR through callbacks: common-subterm elimination with residual `let` binders, gated by a node-savings test. Stdlib only (`tables`, `sequtils`, `strutils`). |
 
 ## Worked example: staging an arithmetic evaluator
 
@@ -131,11 +131,15 @@ Honest boundaries, not roadmap promises:
   application of this framework, not part of it. If you want staged
   relational programming, that lives in Eponym's
   `src/experimental/staging/` for now.
-- **The generic `genlet` works on `GTree`, not on your IR.** Your DSL's
-  residual nodes are opaque `IRNode`s to the framework. To use `genlet`
-  you build your residual as a `GTree` (or map your IR onto one). A
-  callback-based version that traverses client IR directly is a possible
-  v0.2, not in v0.1.0.
+- **`genlet` has two residual-tree interfaces.** `insertLets` works on the
+  standalone `GTree` when a generic representation is convenient. For a DSL
+  that already has its own residual IR, `insertLetsCb` traverses that IR
+  directly through `GenletCallbacks`: the client supplies child enumeration,
+  structural keys, rebuilding, binder-reference construction, and residual
+  let construction. Use the callback form to avoid copying or mapping the IR
+  to `GTree`; use `GTree` when the generic representation is simpler. Both
+  forms use the same savings test, treat `let` binders as sharing boundaries,
+  and assume clients provide pure subtrees.
 - **No runtime codegen, no graph IR, no optimization passes.** The
   residual is a tree your DSL interprets, prints, or compiles. `genlet`
   is the only optimization, and it is a size optimization for pure
