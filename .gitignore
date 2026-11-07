@@ -1,0 +1,9 @@
+# Compiled binaries — build output, never tracked
+tests/test_framework
+tests/test_csp
+tests/test_genlet
+src/staging/framework
+src/staging/csp
+src/staging/genlet
+*.exe
+nimcache/
