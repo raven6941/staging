@@ -30,6 +30,59 @@ proc atom(n: string): GTree = gatom(n)
 proc add(a, b: GTree): GTree = gnode("add", @[a, b])
 proc mul(a, b: GTree): GTree = gnode("mul", @[a, b])
 
+# --- A client IR using the callback API (no GTree involved) ---
+
+type
+  CKind = enum ckAtom, ckAdd, ckMul, ckLet
+  CNode = ref object
+    kind: CKind
+    name: string
+    children: seq[CNode]
+
+proc cAtom(name: string): CNode = CNode(kind: ckAtom, name: name)
+proc cAdd(a, b: CNode): CNode = CNode(kind: ckAdd, children: @[a, b])
+proc cMul(a, b: CNode): CNode = CNode(kind: ckMul, children: @[a, b])
+proc cLet(name: string; bound, body: CNode): CNode =
+  CNode(kind: ckLet, name: name, children: @[bound, body])
+
+proc cKey(n: CNode): string =
+  case n.kind
+  of ckAtom: n.name
+  of ckAdd: "add(" & cKey(n.children[0]) & "," & cKey(n.children[1]) & ")"
+  of ckMul: "mul(" & cKey(n.children[0]) & "," & cKey(n.children[1]) & ")"
+  of ckLet: "let(" & n.name & "," & cKey(n.children[0]) & "," & cKey(n.children[1]) & ")"
+
+proc cEval(n: CNode; env: Table[string, int]): int =
+  case n.kind
+  of ckAtom:
+    try: parseInt(n.name)
+    except ValueError: env[n.name]
+  of ckAdd: cEval(n.children[0], env) + cEval(n.children[1], env)
+  of ckMul: cEval(n.children[0], env) * cEval(n.children[1], env)
+  of ckLet:
+    var env2 = env
+    env2[n.name] = cEval(n.children[0], env)
+    cEval(n.children[1], env2)
+
+proc cCallbacks(): GenletCallbacks[CNode] = GenletCallbacks[CNode](
+  children: proc(n: CNode): seq[CNode] = n.children,
+  key: cKey,
+  isComposite: proc(n: CNode): bool = n.kind != ckAtom,
+  isBoundary: proc(n: CNode): bool = n.kind == ckLet,
+  rebuild: proc(n: CNode; children: seq[CNode]): CNode =
+    CNode(kind: n.kind, name: n.name, children: children),
+  makeRef: cAtom,
+  makeLet: cLet,
+)
+
+proc cRender(n: CNode): string =
+  case n.kind
+  of ckAtom: n.name
+  of ckAdd: "add(" & cRender(n.children[0]) & ", " & cRender(n.children[1]) & ")"
+  of ckMul: "mul(" & cRender(n.children[0]) & ", " & cRender(n.children[1]) & ")"
+  of ckLet: "(let " & n.name & " = " & cRender(n.children[0]) &
+    " in " & cRender(n.children[1]) & ")"
+
 when isMainModule:
   echo "=== generic genlet: arithmetic residual demo ==="
 
@@ -89,5 +142,43 @@ when isMainModule:
   doAssert ($insideOut).startsWith("(let z = 9 in (let genlet0 = "),
     "let must land inside the outer let's body: " & $insideOut
   echo "ok: hoist inside a let body works, binder not crossed"
+
+  # The same cases through a client's own IR and callbacks.
+  let ct = cMul(cAdd(cAtom("x"), cAtom("1")),
+                cAdd(cAtom("y"), cAtom("2")))
+  let cexpr = cAdd(ct, cAdd(ct, ct))
+  var cctx = newGenletCtx()
+  let cout = insertLetsCb(cexpr, cctx, cCallbacks())
+  doAssert cctx.counter == 1
+  doAssert cEval(cout, env) == 45, "callback let-insertion must preserve value"
+  doAssert cRender(cout) ==
+    "(let genlet0 = mul(add(x, 1), add(y, 2)) in add(genlet0, add(genlet0, genlet0)))"
+  echo "ok: callback client hoisted shared composite, value preserved"
+
+  let csmall = cMul(cAtom("x"), cAtom("y"))
+  var cctx2 = newGenletCtx()
+  discard insertLetsCb(cAdd(csmall, csmall), cctx2, cCallbacks())
+  doAssert cctx2.counter == 0
+  echo "ok: callback twice-shared small term left alone"
+
+  var cctx3 = newGenletCtx()
+  discard insertLetsCb(cAdd(cAtom("x"), cAtom("x")), cctx3, cCallbacks())
+  doAssert cctx3.counter == 0
+  echo "ok: callback atom-only duplication left alone"
+
+  var cctx4 = newGenletCtx()
+  let cacross = cLet("z", ct, cAdd(ct, ct))
+  let cacrossOut = insertLetsCb(cacross, cctx4, cCallbacks())
+  doAssert cctx4.counter == 0
+  doAssert cRender(cacrossOut) == cRender(cacross)
+  echo "ok: callback let binder is a sharing boundary"
+
+  var cctx5 = newGenletCtx()
+  let cinside = cLet("z", cAtom("9"), cAdd(ct, cAdd(ct, ct)))
+  let cinsideOut = insertLetsCb(cinside, cctx5, cCallbacks())
+  doAssert cctx5.counter == 1
+  doAssert cEval(cinsideOut, env) == 45
+  doAssert cRender(cinsideOut).startsWith("(let z = 9 in (let genlet0 = ")
+  echo "ok: callback hoist inside a let body works"
 
   echo "=== generic genlet ok ==="

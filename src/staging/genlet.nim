@@ -179,3 +179,112 @@ proc insertLets*(g: GTree; ctx: var GenletCtx): GTree =
       if g2 == rebuilt: break
       rebuilt = g2
     rebuilt
+
+## Callback-based genlet
+##
+## `insertLetsCb` applies the same pass to a client's own residual tree.  The
+## client supplies the small amount of tree knowledge needed by the pass;
+## no intermediate `GTree` is built.
+
+type
+  GenletCallbacks*[T] = object
+    ## Enumerate the immediate residual children of a node.
+    children*: proc(node: T): seq[T]
+    ## Return the structural identity used for common-subterm matching.
+    ## Equal keys must mean equivalent pure residual computations.
+    key*: proc(node: T): string
+    ## True for residual computation nodes, false for atoms.
+    isComposite*: proc(node: T): bool
+    ## True for a residual let binder. Such a node is a sharing boundary;
+    ## its children are still traversed independently.
+    isBoundary*: proc(node: T): bool
+    ## Rebuild a node with the same operator and replacement children.
+    rebuild*: proc(node: T; children: seq[T]): T
+    ## Build a reference to an inserted binder.
+    makeRef*: proc(binder: string): T
+    ## Build a residual let around a bound computation and body.
+    makeLet*: proc(binder: string; bound, body: T): T
+
+proc callbackSize[T](node: T; cb: GenletCallbacks[T]): int =
+  result = 1
+  for child in cb.children(node):
+    result += callbackSize(child, cb)
+
+proc callbackCount[T](node: T; cb: GenletCallbacks[T];
+                     freq: var CountTable[string];
+                     sample: var Table[string, T]) =
+  if cb.isBoundary(node):
+    return
+  if cb.isComposite(node):
+    let k = cb.key(node)
+    freq.inc(k)
+    if k notin sample:
+      sample[k] = node
+  for child in cb.children(node):
+    callbackCount(child, cb, freq, sample)
+
+proc callbackSubst[T](node: T; targetKey: string; replacement: T;
+                      cb: GenletCallbacks[T]): T =
+  if cb.isBoundary(node):
+    return node
+  if cb.isComposite(node) and cb.key(node) == targetKey:
+    return replacement
+  if cb.isComposite(node):
+    var children: seq[T] = @[]
+    for child in cb.children(node):
+      children.add(callbackSubst(child, targetKey, replacement, cb))
+    return cb.rebuild(node, children)
+  node
+
+proc callbackHoist[T](node: T; ctx: var GenletCtx;
+                      cb: GenletCallbacks[T]; changed: var bool): T =
+  var freq = initCountTable[string]()
+  var sample = initTable[string, T]()
+  callbackCount(node, cb, freq, sample)
+
+  var bestKey = ""
+  var bestSave = 0
+  for k, n in freq:
+    if n > 1:
+      let size = callbackSize(sample[k], cb)
+      let save = (n - 1) * (size - 1) - size - 3
+      if save > bestSave:
+        bestSave = save
+        bestKey = k
+  if bestKey == "":
+    return node
+
+  let name = "genlet" & $ctx.counter
+  inc ctx.counter
+  changed = true
+  cb.makeLet(name, sample[bestKey],
+    callbackSubst(node, bestKey, cb.makeRef(name), cb))
+
+proc callbackInsert[T](node: T; ctx: var GenletCtx;
+                       cb: GenletCallbacks[T]): T =
+  if not cb.isComposite(node):
+    return node
+
+  var children: seq[T] = @[]
+  for child in cb.children(node):
+    children.add(callbackInsert(child, ctx, cb))
+  var rebuilt = cb.rebuild(node, children)
+
+  # A boundary may contain independently hoistable terms, but it is never
+  # itself a candidate and its children must not be counted with its parent.
+  if cb.isBoundary(node):
+    return rebuilt
+
+  while true:
+    var changed = false
+    let next = callbackHoist(rebuilt, ctx, cb, changed)
+    if not changed:
+      return rebuilt
+    rebuilt = next
+
+proc insertLetsCb*[T](root: T; ctx: var GenletCtx;
+                      cb: GenletCallbacks[T]): T =
+  ## Bottom-up callback-based let insertion. Composite children are rebuilt
+  ## through `cb.rebuild`; boundary nodes are handled by their own child
+  ## traversal and are never counted or substituted as part of their parent.
+  callbackInsert(root, ctx, cb)
