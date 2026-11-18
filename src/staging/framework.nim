@@ -9,6 +9,9 @@
 ## - `IRNode`: base class for residual IR. DSLs extend with their own nodes.
 ## - `smartOp`: generic smart constructor. Folds when both args static,
 ##   builds IR otherwise. DSLs instantiate with their ops.
+## - `smartLet`: generic binding constructor. Static bindings are passed
+##   directly to the body; dynamic bindings get one residual reference and
+##   one residual let node.
 ## - Tagless-final hook: any `Sym[R]` works with `R = Rep[T]`.
 ##
 ## This is the "smaller system": no graph IR, no runtime codegen, no
@@ -72,6 +75,22 @@ proc smartOpUni*[T](a: Rep[T],
   else:
     dynamic[T](mkNode(a))
 
+proc smartLet*[T](bound: Rep[T],
+                  body: proc(value: Rep[T]): Rep[T],
+                  mkRef: proc(): Rep[T],
+                  mkNode: proc(bound, body: Rep[T]): IRNode): Rep[T] =
+  ## Generic staging rule for a tagless-final `letB` operation.
+  ##
+  ## A direct evaluator can implement `letB` by calling `body(bound)`. A
+  ## staged evaluator should use this helper: static bindings are handled by
+  ## substitution/folding, while dynamic bindings are shared through one
+  ## residual reference and one residual let node.
+  if bound.isStatic:
+    body(bound)
+  else:
+    let bodyResult = body(mkRef())
+    dynamic[T](mkNode(bound, bodyResult))
+
 # --- Tagless-final hook ---
 #
 # Any DSL written as Sym[R] (or similar dictionary-passing style) can
@@ -82,6 +101,7 @@ proc smartOpUni*[T](a: Rep[T],
 #   type ArithSym[R] = object
 #     lit: proc(n: int): R
 #     add: proc(a, b: R): R
+#     letB: proc(bound: R, body: proc(value: R): R): R
 #   proc prog[R](s: ArithSym[R]): R = s.add(s.lit(1), s.lit(2))
 #   prog[Rep[int]](stagedArith)  # builds IR via smartOp
 

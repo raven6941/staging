@@ -33,7 +33,7 @@ no optimization passes — except one, `genlet`.
 
 | Module | What it is |
 |---|---|
-| `staging/framework` | `Rep[T]`, `IRNode`, `lift`, `dynamic`, `smartOp` / `smartOpUni`, tagless-final hook. No imports at all. |
+| `staging/framework` | `Rep[T]`, `IRNode`, `lift`, `dynamic`, `smartOp` / `smartOpUni`, `smartLet`, tagless-final hook. No imports at all. |
 | `staging/csp` | Cross-stage persistence registry: declare every present-stage name the residual may reference, emit it only via `lift`, derive the residual's import block from the registry. No imports at all. |
 | `staging/genlet` | Residual let-insertion over `GTree`, or directly over a client IR through callbacks: common-subterm elimination with residual `let` binders, gated by a node-savings test. Stdlib only (`tables`, `sequtils`, `strutils`). |
 
@@ -50,12 +50,17 @@ type
     vr*: proc(name: string): R
     add*: proc(a, b: R): R
     mul*: proc(a, b: R): R
+    letB*: proc(bound: R, body: proc(value: R): R): R
 
 proc prog1[R](s: ArithSym[R]): R =
   s.mul(s.add(s.lit(1), s.lit(2)), s.lit(3))  # (1 + 2) * 3
 
 proc prog2[R](s: ArithSym[R]): R =
   s.mul(s.add(s.vr("x"), s.lit(1)), s.lit(2))  # (x + 1) * 2
+
+proc progLet[R](s: ArithSym[R]): R =
+  s.letB(s.add(s.vr("x"), s.lit(1)),
+    proc(t: R): R = s.add(t, t))  # let t = x + 1 in t + t
 ```
 
 Instantiate the DSL with `R = int` to run it, or with `R = Rep[int]` to
@@ -75,6 +80,25 @@ ok: getStatic on dynamic Rep raises (staging-time error)
 `prog1` folds entirely at staging time (static 9). `prog2` keeps `x`
 dynamic and residualizes the rest: the `+1` and `*2` survive as residual
 nodes, the literal `2` stays static inside them.
+
+### Binding forms in the tagless-final hook
+
+Expression operations are not enough for a generic evaluator: inlining a
+dynamic `let` binding duplicates its computation at every use. A Sym-style
+DSL that supports bindings should expose a callback-based `letB` operation:
+the direct evaluator calls the body with the bound value, while the staged
+evaluator uses `smartLet` to create one residual reference and one residual
+let node. Thus the same evaluator handles direct, static, and staged `let`
+programs without a separate staged evaluator. `tests/test_framework.nim`
+checks this with `let t = x + 1 in t + t` and verifies that the bound
+expression occurs once in the residual.
+
+`smartLet` is about preserving the semantics of a source-language binding
+form during staging. It is separate from `genlet`, whose `GTree` and
+`insertLetsCb` APIs perform residual common-subterm elimination after a DSL
+has built its residual representation. The same callback pattern can later
+extend to other binding forms such as lambdas or loops, but only `letB` is
+part of this release.
 
 ### From staging to runnable code
 
