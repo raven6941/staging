@@ -13,18 +13,22 @@ import staging/framework
 # --- DSL-specific IR nodes (extend IRNode) ---
 
 type
-  ArithNodeKind = enum akAdd, akMul, akVar
+  ArithNodeKind = enum akAdd, akMul, akVar, akLet
 
   ArithNode = ref object of IRNode
     case kind: ArithNodeKind
     of akVar: varName: string
     of akAdd, akMul: left, right: Rep[int]
+    of akLet:
+      binder: string
+      bound, body: Rep[int]
 
 proc `$`(n: ArithNode): string =
   # Forward declaration: Rep[int] $ defined below
   case n.kind
   of akVar: n.varName
   of akAdd, akMul: "(...)"  # placeholder, full def after Rep $
+  of akLet: "(...)"
 
 proc `$`(r: Rep[int]): string =
   if r.isStatic: "static(" & $r.staticVal & ")"
@@ -34,6 +38,8 @@ proc `$`(r: Rep[int]): string =
     of akVar: "dynamic(" & n.varName & ")"
     of akAdd: "dynamic((" & $n.left & " + " & $n.right & "))"
     of akMul: "dynamic((" & $n.left & " * " & $n.right & "))"
+    of akLet: "dynamic((let " & n.binder & " = " & $n.bound &
+      " in " & $n.body & "))"
 
 # --- DSL smart constructors via framework smartOp ---
 
@@ -59,6 +65,12 @@ proc mulR(a, b: Rep[int]): Rep[int] =
 proc varR(name: string): Rep[int] =
   dynamic[int](varNode(name))
 
+proc letRefNode(): ArithNode =
+  varNode("let0")
+
+proc letNode(bound, body: Rep[int]): ArithNode =
+  ArithNode(kind: akLet, binder: "let0", bound: bound, body: body)
+
 # --- Tagless-final DSL ---
 
 type
@@ -67,6 +79,7 @@ type
     vr*: proc(name: string): R
     add*: proc(a, b: R): R
     mul*: proc(a, b: R): R
+    letB*: proc(bound: R, body: proc(value: R): R): R
 
 proc directArith(): ArithSym[int] =
   ArithSym[int](
@@ -74,6 +87,19 @@ proc directArith(): ArithSym[int] =
     vr: proc(name: string): int = raise newException(ValueError, "unbound: " & name),
     add: proc(a, b: int): int = a + b,
     mul: proc(a, b: int): int = a * b,
+    letB: proc(bound: int, body: proc(value: int): int): int = body(bound),
+  )
+
+proc directArithX(x: int): ArithSym[int] =
+  ## Direct evaluator with "x" bound to `x`, so let programs can be
+  ## evaluated directly and compared with their staged shape.
+  ArithSym[int](
+    lit: proc(n: int): int = n,
+    vr: proc(name: string): int =
+      if name == "x": x else: raise newException(ValueError, "unbound: " & name),
+    add: proc(a, b: int): int = a + b,
+    mul: proc(a, b: int): int = a * b,
+    letB: proc(bound: int, body: proc(value: int): int): int = body(bound),
   )
 
 proc stagedArith(): ArithSym[Rep[int]] =
@@ -82,6 +108,10 @@ proc stagedArith(): ArithSym[Rep[int]] =
     vr: proc(name: string): Rep[int] = varR(name),
     add: addR,
     mul: mulR,
+    letB: proc(bound: Rep[int], body: proc(value: Rep[int]): Rep[int]): Rep[int] =
+      smartLet[int](bound, body,
+        proc(): Rep[int] = dynamic[int](letRefNode()),
+        proc(b, r: Rep[int]): IRNode = letNode(b, r)),
   )
 
 # --- Test programs ---
@@ -93,6 +123,16 @@ proc prog1[R](s: ArithSym[R]): R =
 proc prog2[R](s: ArithSym[R]): R =
   ## (x + 1) * 2 — x dynamic, should residualize
   s.mul(s.add(s.vr("x"), s.lit(1)), s.lit(2))
+
+proc progLet[R](s: ArithSym[R]): R =
+  ## let t = x + 1 in t + t — the dynamic bound must be shared.
+  s.letB(s.add(s.vr("x"), s.lit(1)),
+    proc(t: R): R = s.add(t, t))
+
+proc progLetStatic[R](s: ArithSym[R]): R =
+  ## let t = 1 + 2 in t + t — the bound is static, should fold.
+  s.letB(s.add(s.lit(1), s.lit(2)),
+    proc(t: R): R = s.add(t, t))
 
 when isMainModule:
   echo "=== staging framework: generic arithmetic DSL ==="
@@ -117,6 +157,36 @@ when isMainModule:
   doAssert $r2 == "dynamic((dynamic((dynamic(x) + static(1))) * static(2)))",
     "residual shape mismatch: " & $r2
   echo "ok: dynamic variable residualized to IR"
+
+  # Generic binding hook: the dynamic bound is represented once and both
+  # body uses point at the same residual binder reference.
+  let rLet = progLet(s)
+  doAssert not rLet.isStatic
+  let letN = ArithNode(rLet.node)
+  doAssert letN.kind == akLet
+  doAssert ArithNode(letN.bound.node).kind == akAdd,
+    "let bound expression should be residualized once"
+  let bodyN = ArithNode(letN.body.node)
+  doAssert bodyN.kind == akAdd
+  let leftRef = ArithNode(bodyN.left.node)
+  let rightRef = ArithNode(bodyN.right.node)
+  doAssert leftRef.kind == akVar and rightRef.kind == akVar
+  doAssert leftRef.varName == letN.binder and rightRef.varName == letN.binder
+  doAssert $rLet == "dynamic((let let0 = dynamic((dynamic(x) + static(1))) in " &
+    "dynamic((dynamic(let0) + dynamic(let0)))))"
+  echo "ok: generic letB shares one dynamic bound in one residual let"
+
+  # Same program, direct: let t = 5 + 1 in t + t = 12.
+  doAssert progLet(directArithX(5)) == 12, "direct progLet should be 12"
+  echo "ok: direct progLet = 12"
+
+  # Static bound folds through the same hook: let t = 1 + 2 in t + t = 6.
+  doAssert progLetStatic(directArithX(5)) == 6,
+    "direct progLetStatic should be 6"
+  let rLetStatic = progLetStatic(s)
+  doAssert rLetStatic.isStatic and rLetStatic.staticVal == 6,
+    "static let bound should fold at staging time"
+  echo "ok: static let bound folds to 6"
 
   # getStatic on a dynamic Rep must fail at staging time
   var raised = false
