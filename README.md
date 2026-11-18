@@ -33,7 +33,7 @@ no optimization passes — except one, `genlet`.
 
 | Module | What it is |
 |---|---|
-| `staging/framework` | `Rep[T]`, `IRNode`, `lift`, `dynamic`, `smartOp` / `smartOpUni`, `smartLet`, tagless-final hook. No imports at all. |
+| `staging/framework` | `Rep[T]`, `IRNode`, `lift`, `dynamic`, `smartOp` / `smartOpUni`, `smartLet`, `smartIf`, tagless-final hook. No imports at all. |
 | `staging/csp` | Cross-stage persistence registry: declare every present-stage name the residual may reference, emit it only via `lift`, derive the residual's import block from the registry. No imports at all. |
 | `staging/genlet` | Residual let-insertion over `GTree`, or directly over a client IR through callbacks: common-subterm elimination with residual `let` binders, gated by a node-savings test. Stdlib only (`tables`, `sequtils`, `strutils`). |
 
@@ -99,6 +99,9 @@ form during staging. It is separate from `genlet`, whose `GTree` and
 has built its residual representation. The same callback pattern can later
 extend to other binding forms such as lambdas or loops, but only `letB` is
 part of this release.
+
+`smartIf` takes thunked branches: a static condition calls only the selected
+branch, while a dynamic condition calls both and builds one residual node.
 
 ### From staging to runnable code
 
