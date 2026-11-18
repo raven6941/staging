@@ -8,6 +8,7 @@
 ## staging/framework); the echo-based checks are replaced with doAssert
 ## so a failure fails the run.
 
+import std/strutils
 import staging/framework
 
 # --- DSL-specific IR nodes (extend IRNode) ---
@@ -188,13 +189,18 @@ when isMainModule:
     "static let bound should fold at staging time"
   echo "ok: static let bound folds to 6"
 
-  # getStatic on a dynamic Rep must fail at staging time
+  # getStatic on a dynamic Rep must fail at staging time, with a
+  # message naming the requirement and the remedy (staging#9 step 1)
   var raised = false
+  var msg = ""
   try:
     discard getStatic(r2)
   except AssertionDefect:
     raised = true
+    msg = getCurrentExceptionMsg()
   doAssert raised, "getStatic on a dynamic Rep should raise"
-  echo "ok: getStatic on dynamic Rep raises (staging-time error)"
+  doAssert "staging time" in msg and "Rep[T, true]" in msg,
+    "getStatic failure must name the staging-time requirement and the remedy, got: " & msg
+  echo "ok: getStatic on dynamic Rep raises with requirement + remedy"
 
   echo "=== framework is generic: Rep[T], IRNode, lift, dynamic, smartOp only ==="
