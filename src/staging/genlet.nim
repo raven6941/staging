@@ -56,6 +56,10 @@
 import tables
 import sequtils
 import strutils
+import sets
+import staging/traversal
+
+export TraversalCallbacks, GenletCallbacks
 
 type
   GTreeKind* = enum
@@ -110,75 +114,55 @@ proc treeNodes*(t: GTree): int =
     for c in t.children: result += treeNodes(c)
   of gkLet: result = 1 + treeNodes(t.bound) + treeNodes(t.body)
 
-proc countTerms(t: GTree; freq: var CountTable[string];
-                sample: var Table[string, GTree]) =
-  ## Count composite (gkNode) subtrees by structural key in the tree
-  ## rooted at t. Stops at gkLet boundaries: those are the sharing
-  ## boundaries, so counted occurrences are always replaceable under one
-  ## residual binder placed at the hoist site.
-  case t.kind
-  of gkAtom: discard
-  of gkNode:
-    let k = $t
-    freq.inc(k)
-    if k notin sample: sample[k] = t
-    for c in t.children: countTerms(c, freq, sample)
-  of gkLet: discard  # sharing boundary
+proc gtreeFreeVars(t: GTree): seq[string] =
+  var found = initHashSet[string]()
+  proc walk(n: GTree; bound: HashSet[string]) =
+    case n.kind
+    of gkAtom:
+      try: discard parseInt(n.name)
+      except ValueError:
+        if n.name notin bound: found.incl(n.name)
+    of gkNode:
+      for c in n.children: walk(c, bound)
+    of gkLet:
+      var nested = bound
+      nested.incl(n.binder)
+      walk(n.bound, nested)
+      walk(n.body, nested)
+  walk(t, initHashSet[string]())
+  for name in found: result.add(name)
 
-proc substShared(g, target, repl: GTree): GTree =
-  ## Replace occurrences of target in g with repl, using the same boundary
-  ## discipline as countTerms (so exactly the counted occurrences are
-  ## replaced). A node equal to target is replaced whole, without
-  ## descending into it.
-  case g.kind
-  of gkAtom: g
-  of gkNode:
-    if $g == $target: repl
-    else: gnode(g.op, g.children.mapIt(substShared(it, target, repl)))
-  of gkLet: g  # boundary: not counted, not touched
+proc gtreeCallbacks*(): TraversalCallbacks[GTree] =
+  TraversalCallbacks[GTree](
+    children: proc(n: GTree): seq[GTree] =
+      case n.kind
+      of gkAtom: @[]
+      of gkNode: n.children
+      of gkLet: @[n.bound, n.body],
+    key: proc(n: GTree): string = $n,
+    isComposite: proc(n: GTree): bool = n.kind != gkAtom,
+    isBoundary: proc(n: GTree): bool = n.kind == gkLet,
+    rebuild: proc(n: GTree; cs: seq[GTree]): GTree =
+      case n.kind
+      of gkAtom: n
+      of gkNode: gnode(n.op, cs)
+      of gkLet: glet(n.binder, cs[0], cs[1]),
+    makeRef: gatom,
+    makeLet: glet,
+    binders: proc(n: GTree): seq[string] = @[n.binder],
+    freeVars: gtreeFreeVars)
 
-proc hoist(g: GTree; ctx: var GenletCtx): GTree =
-  ## Insert one residual let at this node for the candidate with the
-  ## largest positive node savings, if any.
-  var freq = initCountTable[string]()
-  var sample = initTable[string, GTree]()
-  countTerms(g, freq, sample)
-  var bestKey = ""
-  var bestSave = 0
-  for k, n in freq:
-    if n > 1:
-      let s = treeNodes(sample[k])
-      # Savings: (n-1) occurrences replaced by 1-node placeholders,
-      # minus the residual equation (s term nodes + ~3 nodes: the let
-      # itself, the binder, the added structure).
-      let save = (n - 1) * (s - 1) - s - 3
-      if save > bestSave:
-        bestSave = save
-        bestKey = k
-  if bestKey == "": return g
-  let t = sample[bestKey]
-  let name = "genlet" & $ctx.counter
-  inc ctx.counter
-  glet(name, t, substShared(g, t, gatom(name)))
+proc insertLetsCb*[T](root: T; ctx: var GenletCtx;
+                      cb: GenletCallbacks[T]): T
 
 proc insertLets*(g: GTree; ctx: var GenletCtx): GTree =
   ## Bottom-up: inner lets first, then hoist at each node.
   ## Loops per node because one hoist can reveal the next candidate; each
   ## hoist strictly reduces node count (savings test), so the loop
   ## terminates.
-  case g.kind
-  of gkAtom: g
-  of gkLet:
-    # Binder boundary: recurse into bound and body separately; never
-    # hoist a term across the let.
-    glet(g.binder, insertLets(g.bound, ctx), insertLets(g.body, ctx))
-  of gkNode:
-    var rebuilt = gnode(g.op, g.children.mapIt(insertLets(it, ctx)))
-    while true:
-      let g2 = hoist(rebuilt, ctx)
-      if g2 == rebuilt: break
-      rebuilt = g2
-    rebuilt
+  var cb = gtreeCallbacks()
+  cb.freeVars = nil
+  insertLetsCb(g, ctx, cb)
 
 ## Callback-based genlet
 ##
@@ -186,61 +170,28 @@ proc insertLets*(g: GTree; ctx: var GenletCtx): GTree =
 ## client supplies the small amount of tree knowledge needed by the pass;
 ## no intermediate `GTree` is built.
 
-type
-  GenletCallbacks*[T] = object
-    ## Enumerate the immediate residual children of a node.
-    children*: proc(node: T): seq[T]
-    ## Return the structural identity used for common-subterm matching.
-    ## Equal keys must mean equivalent pure residual computations.
-    key*: proc(node: T): string
-    ## True for residual computation nodes, false for atoms.
-    isComposite*: proc(node: T): bool
-    ## True for a residual let binder. Such a node is a sharing boundary;
-    ## its children are still traversed independently.
-    isBoundary*: proc(node: T): bool
-    ## Rebuild a node with the same operator and replacement children.
-    rebuild*: proc(node: T; children: seq[T]): T
-    ## Build a reference to an inserted binder.
-    makeRef*: proc(binder: string): T
-    ## Build a residual let around a bound computation and body.
-    makeLet*: proc(binder: string; bound, body: T): T
-
 proc callbackSize[T](node: T; cb: GenletCallbacks[T]): int =
   result = 1
   for child in cb.children(node):
     result += callbackSize(child, cb)
 
-proc callbackCount[T](node: T; cb: GenletCallbacks[T];
-                     freq: var CountTable[string];
-                     sample: var Table[string, T]) =
+proc callbackSamples[T](node: T; cb: GenletCallbacks[T];
+                        sample: var Table[string, T]) =
   if cb.isBoundary(node):
     return
   if cb.isComposite(node):
     let k = cb.key(node)
-    freq.inc(k)
     if k notin sample:
       sample[k] = node
   for child in cb.children(node):
-    callbackCount(child, cb, freq, sample)
-
-proc callbackSubst[T](node: T; targetKey: string; replacement: T;
-                      cb: GenletCallbacks[T]): T =
-  if cb.isBoundary(node):
-    return node
-  if cb.isComposite(node) and cb.key(node) == targetKey:
-    return replacement
-  if cb.isComposite(node):
-    var children: seq[T] = @[]
-    for child in cb.children(node):
-      children.add(callbackSubst(child, targetKey, replacement, cb))
-    return cb.rebuild(node, children)
-  node
+    callbackSamples(child, cb, sample)
 
 proc callbackHoist[T](node: T; ctx: var GenletCtx;
                       cb: GenletCallbacks[T]; changed: var bool): T =
   var freq = initCountTable[string]()
   var sample = initTable[string, T]()
-  callbackCount(node, cb, freq, sample)
+  freq = occurrences(node, cb)
+  callbackSamples(node, cb, sample)
 
   var bestKey = ""
   var bestSave = 0
@@ -257,8 +208,9 @@ proc callbackHoist[T](node: T; ctx: var GenletCtx;
   let name = "genlet" & $ctx.counter
   inc ctx.counter
   changed = true
-  cb.makeLet(name, sample[bestKey],
-    callbackSubst(node, bestKey, cb.makeRef(name), cb))
+  var replacements = initTable[string, T]()
+  replacements[bestKey] = cb.makeRef(name)
+  cb.makeLet(name, sample[bestKey], substTree(node, cb, replacements))
 
 proc callbackInsert[T](node: T; ctx: var GenletCtx;
                        cb: GenletCallbacks[T]): T =

@@ -178,6 +178,9 @@ Honest boundaries, not roadmap promises:
   to `GTree`; use `GTree` when the generic representation is simpler. Both
   forms use the same savings test, treat `let` binders as sharing boundaries,
   and assume clients provide pure subtrees.
+- **`traversal` provides the shared IR API.** `TraversalCallbacks` describes a
+  client tree for bottom-up `mapTree`, binder-aware `substTree`, and
+  `occurrences`; `GenletCallbacks` is its source-compatible alias.
 - **No built-in runtime codegen, graph IR, or optimization passes.** The
   residual is a tree your DSL interprets, prints, or compiles. The worked
   arithmetic example shows a small DSL-level emitter; the framework itself

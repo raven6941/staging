@@ -3,8 +3,11 @@ tests/test_framework
 tests/test_csp
 tests/test_genlet
 tests/test_codegen
+tests/test_traversal
+tests/test_smartif
 src/staging/framework
 src/staging/csp
 src/staging/genlet
+src/staging/traversal
 *.exe
 nimcache/
