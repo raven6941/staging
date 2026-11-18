@@ -76,6 +76,18 @@ ok: getStatic on dynamic Rep raises (staging-time error)
 dynamic and residualizes the rest: the `+1` and `*2` survive as residual
 nodes, the literal `2` stays static inside them.
 
+### From staging to runnable code
+
+The complete path from a staged value to a runnable program is demonstrated
+by `tests/test_codegen.nim`. It uses the same tagless-final arithmetic shape,
+stages `(x + (1 + 2)) * 2`, and emits ordinary Nim source for the residual;
+the `1 + 2` part is folded during staging. The test writes that source to a
+clean temporary directory, invokes the `nim` compiler without this library's
+`src` on its path, runs the resulting binary, and checks its result against
+direct evaluation. This is deliberately a DSL-level emitter: the framework
+supplies binding-time specialization and the DSL supplies the residual-node
+printer.
+
 ### genlet: sharing the residual
 
 A stager that duplicates a shared computation pays for it twice at runtime.
@@ -117,8 +129,10 @@ or clone and use `--path:src`.
 nimble test
 ```
 
-Runs `tests/test_framework.nim`, `tests/test_csp.nim`, and
-`tests/test_genlet.nim`. Verified on Nim 2.2.12 and 2.4.0.
+Runs `tests/test_framework.nim`, `tests/test_codegen.nim`,
+`tests/test_csp.nim`, and `tests/test_genlet.nim`. The codegen test
+additionally compiles and runs its emitted residual program. Verified on Nim
+2.2.12 and 2.4.0.
 
 ## Scope — what this library does NOT yet include
 
@@ -140,11 +154,12 @@ Honest boundaries, not roadmap promises:
   to `GTree`; use `GTree` when the generic representation is simpler. Both
   forms use the same savings test, treat `let` binders as sharing boundaries,
   and assume clients provide pure subtrees.
-- **No runtime codegen, no graph IR, no optimization passes.** The
-  residual is a tree your DSL interprets, prints, or compiles. `genlet`
-  is the only optimization, and it is a size optimization for pure
-  computations — clients with effectful nodes must only feed it pure
-  subtrees.
+- **No built-in runtime codegen, graph IR, or optimization passes.** The
+  residual is a tree your DSL interprets, prints, or compiles. The worked
+  arithmetic example shows a small DSL-level emitter; the framework itself
+  remains code-generation agnostic. `genlet` is the only optimization, and it
+  is a size optimization for pure computations — clients with effectful nodes
+  must only feed it pure subtrees.
 - **No macro/bracket syntax.** Staging is expressed through `Rep[T]` and
   smart constructors in ordinary Nim code, not through MetaOCaml-style
   brackets and escape. A macro layer is out of scope for v0.1.0.
