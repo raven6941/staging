@@ -33,7 +33,7 @@ no optimization passes — except one, `genlet`.
 
 | Module | What it is |
 |---|---|
-| `staging/framework` | `Rep[T]`, `IRNode`, `lift`, `dynamic`, `smartOp` / `smartOpUni`, `smartLet`, `smartIf`, tagless-final hook. No imports at all. |
+| `staging/framework` | `Rep[T]`, `IRNode`, `lift`, `dynamic`, `smartOp` / `smartOpUni`, `smartLet`, `smartIf`, residual `Var[T]` cells with `readVar` / `writeVar`, `Rep[Unit]` statements with `seqR`, and the tagless-final hook. No imports at all. |
 | `staging/csp` | Cross-stage persistence registry: declare every present-stage name the residual may reference, emit it only via `lift`, derive the residual's import block from the registry. No imports at all. |
 | `staging/genlet` | Residual let-insertion over `GTree`, or directly over a client IR through callbacks: common-subterm elimination with residual `let` binders, gated by a node-savings test. Stdlib only (`tables`, `sequtils`, `strutils`). |
 
