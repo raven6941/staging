@@ -110,6 +110,12 @@ state in the body is not residual loop state. `tests/test_while.nim` emits a
 scanner-shaped sum loop, compiles it in a clean directory, and compares it
 with direct evaluation, including a dynamic zero bound.
 
+Residual functions use `Rep[proc(A): B]` and `smartFun`. DSLs supply an
+explicit key and keyed registry: a reference is published before the body is
+built, so recursive calls become residual calls and each body is built once.
+`tests/test_fun.nim` stages the Ackermann tower, traverses function nodes, and
+emits its three residual procedures as one compilable Nim program.
+
 ### From staging to runnable code
 
 The complete path from a staged value to a runnable program is demonstrated
