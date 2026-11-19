@@ -19,6 +19,7 @@ proc evalTree(t: GTree; env: Table[string, int]): int =
   of gkNode:
     case t.op
     of "add": evalTree(t.children[0], env) + evalTree(t.children[1], env)
+    of "sub": evalTree(t.children[0], env) - evalTree(t.children[1], env)
     of "mul": evalTree(t.children[0], env) * evalTree(t.children[1], env)
     else: raise newException(ValueError, "unknown op: " & t.op)
   of gkLet:
@@ -29,6 +30,16 @@ proc evalTree(t: GTree; env: Table[string, int]): int =
 proc atom(n: string): GTree = gatom(n)
 proc add(a, b: GTree): GTree = gnode("add", @[a, b])
 proc mul(a, b: GTree): GTree = gnode("mul", @[a, b])
+proc sub(a, b: GTree): GTree = gnode("sub", @[a, b])
+
+# Stencil helpers mirroring ~/workspace/buildout/staging-vetting/stencil.nim:
+# w1(j) = a(j)*a(j+1), wm(j) = a(j) - w1(j) + w1(j-1),
+# w2(j) = wm(j)*wm(j+1), b(j) = wm(j) - w2(j) + w2(j-1).
+proc sA(j: int): GTree = atom("a" & $j)
+proc sW1(j: int): GTree = mul(sA(j), sA(j + 1))
+proc sWm(j: int): GTree = add(sub(sA(j), sW1(j)), sW1(j - 1))
+proc sW2(j: int): GTree = mul(sWm(j), sWm(j + 1))
+proc sB(j: int): GTree = add(sub(sWm(j), sW2(j)), sW2(j - 1))
 
 # --- A client IR using the callback API (no GTree involved) ---
 
@@ -142,6 +153,51 @@ when isMainModule:
   doAssert ($insideOut).startsWith("(let z = 9 in (let genlet0 = "),
     "let must land inside the outer let's body: " & $insideOut
   echo "ok: hoist inside a let body works, binder not crossed"
+
+  # Scope-aware placement, real stencil shape (vetting port (c)):
+  # b(2) + b(3) over a[0..5]. The old pass hoisted wm(2)/wm(3) and
+  # left mul(a2,a3) computed 4x; scope-aware placement binds it once,
+  # at the root, before the wm hoists collapse its count. The five
+  # insertions are the three shared w1 products plus wm(2) and wm(3).
+  let stencil = add(sB(2), sB(3))
+  var stencilCtx = newGenletCtx()
+  let stencilOut = insertLets(stencil, stencilCtx)
+  let stencilEnv = {"a0": 1, "a1": 2, "a2": 3, "a3": 4, "a4": 5,
+                    "a5": 6}.toTable
+  doAssert evalTree(stencilOut, stencilEnv) == -21
+  doAssert stencilCtx.counter == 5,
+    "expected 3 w1 products + wm(2) + wm(3): " & $stencilOut
+  doAssert count($stencilOut, "mul(a2, a3)") == 1,
+    "mul(a2, a3) must be computed once: " & $stencilOut
+  doAssert count($stencilOut, "sub(a2, genlet") == 1,
+    "wm(2) must be bound once: " & $stencilOut
+  doAssert count($stencilOut, "sub(a3, genlet") == 1,
+    "wm(3) must be bound once: " & $stencilOut
+  echo "ok: scope-aware placement shares stencil intermediates globally"
+
+  # A term referring to an intervening binder is not safe to lift.
+  let scopedTerm = mul(atom("z"), atom("q"))
+  let scopedTree = add(glet("z", atom("2"), add(scopedTerm, scopedTerm)),
+                       scopedTerm)
+  var scopedCtx = newGenletCtx()
+  let scopedOut = insertLets(scopedTree, scopedCtx)
+  doAssert count($scopedOut, "mul(z, q)") == 3
+  doAssert scopedCtx.counter == 0
+  echo "ok: scope check rejects lifting a binder-dependent term"
+
+  # Load-bearing version of the same check: this term DOES qualify on
+  # savings (3 occurrences, 7 nodes, saving 2), so only the scope
+  # check can refuse it — it occurs twice inside a let binding z and
+  # once outside it, and mentions z. Without the check the root hoist
+  # would fire and counter would be 1.
+  let big = add(mul(atom("z"), atom("q")), mul(atom("z"), atom("q")))
+  let scopedTree2 = add(glet("z", atom("2"), add(big, big)), big)
+  var scopedCtx2 = newGenletCtx()
+  let scopedOut2 = insertLets(scopedTree2, scopedCtx2)
+  doAssert scopedCtx2.counter == 0,
+    "scope check must refuse the binder-dependent term"
+  doAssert count($scopedOut2, "add(mul(z, q), mul(z, q))") == 3
+  echo "ok: scope check refuses a qualifying binder-dependent term"
 
   # The same cases through a client's own IR and callbacks.
   let ct = cMul(cAdd(cAtom("x"), cAtom("1")),

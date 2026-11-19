@@ -31,13 +31,18 @@
 ## always -4, so a term shared only twice never qualifies; sharing pays
 ## from n = 3 with a term of at least 6 nodes.
 ##
-## Sharing boundaries: insertion never crosses a `let` binder. A `let` is
-## both a counting boundary (occurrences inside it are not counted with
-## occurrences outside it) and a substitution boundary (occurrences inside
-## it are not replaced). This is the generic form of the original's
-## `rgFresh`/`rgDisj` boundary discipline: no variable is ever lifted out
-## of its scope and no branch structure is reshuffled. Hoisting *inside* a
-## let body is still allowed — the boundary only blocks crossing it.
+## Sharing boundaries: let nodes are scope-checked boundaries, not absolute
+## counting/substitution boundaries. When freeVars is supplied, occurrences
+## may cross a let only when the candidate's free variables do not intersect
+## binders introduced on the way to any occurrence. With freeVars nil, the
+## conservative per-region boundary behaviour remains in force.
+##
+## Placement order: at each node the pass hoists before recursing, and
+## among qualifying candidates takes the smallest first. A larger term
+## hoisted first collapses the counts of the smaller terms inside it,
+## so the smaller term must go first (its hoist leaves larger terms'
+## counts untouched — their copies change identically). See
+## callbackInsert / callbackHoist.
 ##
 ## Effect policy: the pass is a size optimization for pure computations.
 ## Let-insertion is never required for correctness here, only an optional
@@ -156,12 +161,13 @@ proc insertLetsCb*[T](root: T; ctx: var GenletCtx;
                       cb: GenletCallbacks[T]): T
 
 proc insertLets*(g: GTree; ctx: var GenletCtx): GTree =
-  ## Bottom-up: inner lets first, then hoist at each node.
-  ## Loops per node because one hoist can reveal the next candidate; each
-  ## hoist strictly reduces node count (savings test), so the loop
-  ## terminates.
+  ## Hoist at each node before recursing into its children (see
+  ## callbackInsert), so a candidate spanning several children is
+  ## decided while its count is still whole. Loops per node because one
+  ## hoist can reveal the next candidate; each hoist strictly reduces
+  ## node count — the savings test implies a true change of
+  ## -(n-1)*(s-1) + 2 < 0 — so the loop terminates.
   var cb = gtreeCallbacks()
-  cb.freeVars = nil
   insertLetsCb(g, ctx, cb)
 
 ## Callback-based genlet
@@ -190,18 +196,52 @@ proc callbackHoist[T](node: T; ctx: var GenletCtx;
                       cb: GenletCallbacks[T]; changed: var bool): T =
   var freq = initCountTable[string]()
   var sample = initTable[string, T]()
-  freq = occurrences(node, cb)
-  callbackSamples(node, cb, sample)
+  var contexts = initTable[string, seq[seq[string]]]()
+  if cb.freeVars.isNil:
+    freq = occurrences(node, cb)
+    callbackSamples(node, cb, sample)
+  else:
+    let global = globalOccurrences(node, cb)
+    for k, entries in global:
+      freq[k] = entries.len
+      if entries.len > 0:
+        sample[k] = entries[0].node
+        for entry in entries:
+          contexts.mgetOrPut(k, @[]).add(entry.binders)
 
   var bestKey = ""
+  var bestSize = 0
   var bestSave = 0
   for k, n in freq:
     if n > 1:
       let size = callbackSize(sample[k], cb)
       let save = (n - 1) * (size - 1) - size - 3
-      if save > bestSave:
-        bestSave = save
+      if save <= 0:
+        continue
+      var scopeSafe = true
+      if not cb.freeVars.isNil:
+        let free = cb.freeVars(sample[k])
+        for context in contexts[k]:
+          for name in free:
+            if name in context: scopeSafe = false
+      if not scopeSafe:
+        continue
+      # Smallest qualifying composite first: hoisting a containing term
+      # collapses the counts of the terms inside it (their copies are
+      # replaced by the new reference, leaving only the bound copy), so
+      # a larger term hoisted first can push a smaller shared term below
+      # the savings threshold before the pass ever sees it at the shared
+      # site (stencil: wm(2)/wm(3) hoisted first leave mul(a2,a3) at 4
+      # occurrences, saving exactly 0). Hoisting the smaller term first
+      # leaves larger terms' counts untouched — their copies change
+      # identically — so nothing is lost. Ties break by greatest saving,
+      # then by key, so placement is deterministic.
+      if bestKey == "" or size < bestSize or
+          (size == bestSize and save > bestSave) or
+          (size == bestSize and save == bestSave and k < bestKey):
         bestKey = k
+        bestSize = size
+        bestSave = save
   if bestKey == "":
     return node
 
@@ -217,16 +257,39 @@ proc callbackInsert[T](node: T; ctx: var GenletCtx;
   if not cb.isComposite(node):
     return node
 
-  var children: seq[T] = @[]
-  for child in cb.children(node):
-    children.add(callbackInsert(child, ctx, cb))
-  var rebuilt = cb.rebuild(node, children)
-
-  # A boundary may contain independently hoistable terms, but it is never
-  # itself a candidate and its children must not be counted with its parent.
+  # A boundary is never itself a hoist site: recurse into its children
+  # and return rebuilt. (A term occurring on both sides of a boundary
+  # is only hoisted above it by an ancestor's hoist, and only when the
+  # scope check allows.)
   if cb.isBoundary(node):
-    return rebuilt
+    var children: seq[T] = @[]
+    for child in cb.children(node):
+      children.add(callbackInsert(child, ctx, cb))
+    return cb.rebuild(node, children)
 
+  # Hoist at this node FIRST, on global counts over the subtree as it
+  # stands: a candidate that only qualifies at this site (its
+  # occurrences span several children) must be decided before the
+  # children's own hoists rewrite the subtree and collapse its count
+  # (stencil: mul(a2,a3) qualifies only at the root; the wm hoists
+  # below would leave it at 4 occurrences, saving 0).
+  var current = node
+  while true:
+    var changed = false
+    let next = callbackHoist(current, ctx, cb, changed)
+    if not changed:
+      break
+    current = next
+
+  # Then recurse into the children, so sharing inside a region (and
+  # inside a just-inserted let's bound value) is still found.
+  var children: seq[T] = @[]
+  for child in cb.children(current):
+    children.add(callbackInsert(child, ctx, cb))
+  var rebuilt = cb.rebuild(current, children)
+
+  # And hoist again: the children's rewriting can reveal a candidate
+  # at this node (e.g. substitution making two subterms equal).
   while true:
     var changed = false
     let next = callbackHoist(rebuilt, ctx, cb, changed)
@@ -236,7 +299,13 @@ proc callbackInsert[T](node: T; ctx: var GenletCtx;
 
 proc insertLetsCb*[T](root: T; ctx: var GenletCtx;
                       cb: GenletCallbacks[T]): T =
-  ## Bottom-up callback-based let insertion. Composite children are rebuilt
-  ## through `cb.rebuild`; boundary nodes are handled by their own child
-  ## traversal and are never counted or substituted as part of their parent.
+  ## Hoist-first traversal: at each non-boundary node the pass hoists on
+  ## global counts over the subtree as it stands, then recurses into the
+  ## children, then hoists again. Boundary nodes are never hoist sites
+  ## themselves; their children are traversed separately. When freeVars
+  ## is supplied, occurrences inside a boundary are counted with
+  ## occurrences outside it and may be hoisted above it, but only when
+  ## the scope check proves the candidate mentions none of the
+  ## intervening binders; with freeVars nil the old per-region
+  ## discipline holds.
   callbackInsert(root, ctx, cb)
