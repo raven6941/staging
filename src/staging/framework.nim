@@ -48,8 +48,13 @@ proc dynamic*[T](node: IRNode): Rep[T] =
 
 proc getStatic*[T](r: Rep[T]): T =
   ## Extract static value. Fails if r is dynamic — this is a staging-time
-  ## error (you asked for something static that isn't).
-  assert r.isStatic, "getStatic: Rep is dynamic, not static"
+  ## error (you asked for something static that isn't). If the DSL
+  ## requires staticness here, the type-level spelling is Rep[T, true]
+  ## (staging#9); this assertion is the residual path for values whose
+  ## staticness the types cannot see.
+  assert r.isStatic, "getStatic: Rep is dynamic, not static — the value " &
+    "must be known at staging time; if the DSL requires staticness here, " &
+    "see Rep[T, true] (staging#9)"
   r.staticVal
 
 proc smartOp*[T](a, b: Rep[T],
