@@ -44,12 +44,17 @@
 ## counts untouched — their copies change identically). See
 ## callbackInsert / callbackHoist.
 ##
-## Effect policy: the pass is a size optimization for pure computations.
-## Let-insertion is never required for correctness here, only an optional
-## size optimization. When effectful primitives appear, insertion must be
-## restricted to computations the effect annotation marks duplicable.
-## This module does not track effects; clients with effectful nodes must
-## only feed it pure subtrees (or extend `GTree` with an effect mark).
+## Effect policy: `isPure` is an optional client annotation.  A nil query
+## means pure, preserving today's behaviour.  A node for which the query
+## returns false is a sharing boundary like `let`: it is never hoisted or
+## duplicated, and a pure candidate is never hoisted across it.  A pure
+## candidate CONTAINING an effectful node is likewise never hoisted —
+## sharing it would execute the effect fewer times.  Children of an
+## effectful node are still exposed to traversal and may be optimized
+## within that node.
+## The long-term home of this classification (callbacks or a framework-level
+## node tag) remains open; callbacks are the least invasive choice until a
+## second consumer needs the information.
 ##
 ## What this is NOT: it is not the relational genlet. The original's
 ## `RelGoal`/`RTerm` version, its `insertLetsIntoSpecs` driver over
@@ -183,7 +188,7 @@ proc callbackSize[T](node: T; cb: GenletCallbacks[T]): int =
 
 proc callbackSamples[T](node: T; cb: GenletCallbacks[T];
                         sample: var Table[string, T]) =
-  if cb.isBoundary(node):
+  if isSharingBoundary(node, cb):
     return
   if cb.isComposite(node):
     let k = cb.key(node)
@@ -217,6 +222,10 @@ proc callbackHoist[T](node: T; ctx: var GenletCtx;
       let size = callbackSize(sample[k], cb)
       let save = (n - 1) * (size - 1) - size - 3
       if save <= 0:
+        continue
+      # A pure candidate containing an effect must never be hoisted:
+      # sharing it would execute the effect fewer times.
+      if containsEffect(sample[k], cb):
         continue
       var scopeSafe = true
       if not cb.freeVars.isNil:
@@ -261,7 +270,7 @@ proc callbackInsert[T](node: T; ctx: var GenletCtx;
   # and return rebuilt. (A term occurring on both sides of a boundary
   # is only hoisted above it by an ancestor's hoist, and only when the
   # scope check allows.)
-  if cb.isBoundary(node):
+  if isSharingBoundary(node, cb):
     var children: seq[T] = @[]
     for child in cb.children(node):
       children.add(callbackInsert(child, ctx, cb))

@@ -14,3 +14,4 @@ nimcache/
 tests/test_vars
 tests/test_while
 tests/test_fun
+tests/test_effects

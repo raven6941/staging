@@ -22,3 +22,4 @@ task test, "Run the self-tests":
   exec "nim c -r --hints:off --path:src tests/test_vars.nim"
   exec "nim c -r --hints:off --path:src tests/test_while.nim"
   exec "nim c -r --hints:off --path:src tests/test_fun.nim"
+  exec "nim c -r --hints:off --path:src tests/test_effects.nim"
