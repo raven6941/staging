@@ -25,6 +25,25 @@ type
     node*: T
     binders*: seq[string]
 
+proc isEffectful*[T](node: T; cb: TraversalCallbacks[T]): bool =
+  ## A node the client's `isPure` query marks effectful.  A nil query
+  ## means pure.
+  not cb.isPure.isNil and not cb.isPure(node)
+
+proc containsEffect*[T](node: T; cb: TraversalCallbacks[T]): bool =
+  ## True when node or any node in its subtree is effectful.  Genlet
+  ## uses this so a pure candidate containing an effect is never hoisted:
+  ## sharing it would execute the effect fewer times.
+  if isEffectful(node, cb): return true
+  for child in cb.children(node):
+    if containsEffect(child, cb): return true
+  false
+
+proc isSharingBoundary*[T](node: T; cb: TraversalCallbacks[T]): bool =
+  ## Effect annotations are deliberately only a genlet/traversal concern for
+  ## now.  A missing query preserves the historical all-pure behaviour.
+  cb.isBoundary(node) or isEffectful(node, cb)
+
 proc intersects(a: seq[string]; scope: HashSet[string]): bool =
   for name in a:
     if name in scope: return true
@@ -56,14 +75,14 @@ proc mapTree*[T](root: T; cb: TraversalCallbacks[T];
 proc substImpl[T](node: T; cb: TraversalCallbacks[T];
                   subst: Table[string, T]; scope: HashSet[string]): T =
   # With no free-variable query, preserve genlet's boundary discipline.
-  if cb.isBoundary(node) and cb.freeVars.isNil:
+  if isSharingBoundary(node, cb) and cb.freeVars.isNil:
     return node
 
   var childScope = scope
   if cb.isBoundary(node) and not cb.binders.isNil:
     for name in cb.binders(node): childScope.incl(name)
 
-  if not cb.isBoundary(node):
+  if not isSharingBoundary(node, cb):
     let k = cb.key(node)
     if k in subst:
       let replacement = subst[k]
@@ -86,7 +105,7 @@ proc occurrences*[T](root: T; cb: TraversalCallbacks[T]): CountTable[string] =
   ## Count composite nodes, matching the original genlet counting contract.
   var freq = initCountTable[string]()
   proc walk(node: T) =
-    if cb.isBoundary(node): return
+    if isSharingBoundary(node, cb): return
     if cb.isComposite(node): freq.inc(cb.key(node))
     for child in cb.children(node): walk(child)
   walk(root)
@@ -95,13 +114,16 @@ proc occurrences*[T](root: T; cb: TraversalCallbacks[T]): CountTable[string] =
 proc globalOccurrences*[T](root: T; cb: TraversalCallbacks[T]):
     Table[string, seq[GlobalOccurrence[T]]] =
   ## Global counting counterpart to `occurrences`: do not stop at
-  ## boundaries, and retain each occurrence's binder context.
+  ## boundaries, and retain each occurrence's binder context.  Effectful
+  ## nodes are the one exception: the walk stops at them, so a pure
+  ## composite inside an effect is never counted for hoisting above it.
   var found = initTable[string, seq[GlobalOccurrence[T]]]()
   proc walk(node: T; scope: seq[string]) =
-    if cb.isComposite(node) and not cb.isBoundary(node):
+    if cb.isComposite(node) and not isSharingBoundary(node, cb):
       let k = cb.key(node)
       found.mgetOrPut(k, @[]).add(GlobalOccurrence[T](node: node,
         binders: scope))
+    if isEffectful(node, cb): return
     var childScope = scope
     if cb.isBoundary(node) and not cb.binders.isNil:
       for name in cb.binders(node):

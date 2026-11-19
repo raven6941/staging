@@ -103,6 +103,12 @@ part of this release.
 `smartIf` takes thunked branches: a static condition calls only the selected
 branch, while a dynamic condition calls both and builds one residual node.
 
+Effect annotations are an optional `TraversalCallbacks.isPure` query used by
+genlet. A missing query means pure; returning false makes a node a sharing
+boundary that genlet will not hoist, duplicate, or cross, while traversal
+continues through its children. This is intentionally only a two-level
+classification, not an effect-summary or reordering system.
+
 Residual while loops use the same thunk discipline: a static-false condition
 folds to `unit()`, while every other condition builds one residual `while`
 node. The condition and body are built once at staging time, so staging-time
@@ -193,7 +199,9 @@ Honest boundaries, not roadmap promises:
   let construction. Use the callback form to avoid copying or mapping the IR
   to `GTree`; use `GTree` when the generic representation is simpler. Both
   forms use the same savings test, treat `let` binders as sharing boundaries,
-  and assume clients provide pure subtrees.
+  and honor `isPure`: nil means pure, while false marks a sharing boundary.
+  The classification's long-term home (callbacks or a framework-level node
+  tag) remains open until another consumer needs it.
 - **`traversal` provides the shared IR API.** `TraversalCallbacks` describes a
   client tree for bottom-up `mapTree`, binder-aware `substTree`, and
   `occurrences`; `GenletCallbacks` is its source-compatible alias.
@@ -202,7 +210,8 @@ Honest boundaries, not roadmap promises:
   arithmetic example shows a small DSL-level emitter; the framework itself
   remains code-generation agnostic. `genlet` is the only optimization, and it
   is a size optimization for pure computations — clients with effectful nodes
-  must only feed it pure subtrees.
+  honor the optional `isPure` classification: nil means pure, while false
+  marks a sharing boundary.
 - **No macro/bracket syntax.** Staging is expressed through `Rep[T]` and
   smart constructors in ordinary Nim code, not through MetaOCaml-style
   brackets and escape. A macro layer is out of scope for v0.1.0.
