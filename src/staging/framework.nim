@@ -96,6 +96,23 @@ proc smartLet*[T](bound: Rep[T],
     let bodyResult = body(mkRef())
     dynamic[T](mkNode(bound, bodyResult))
 
+proc smartIf*[T](cond: Rep[bool],
+                 thenB, elseB: proc(): Rep[T],
+                 mkNode: proc(c: Rep[bool], t, e: Rep[T]): IRNode): Rep[T] =
+  ## Generic staging rule for a residual conditional.
+  ##
+  ## A static condition evaluates only the selected branch thunk. A dynamic
+  ## condition evaluates both branch thunks and builds one residual if node.
+  if cond.isStatic:
+    if cond.staticVal:
+      thenB()
+    else:
+      elseB()
+  else:
+    let thenResult = thenB()
+    let elseResult = elseB()
+    dynamic[T](mkNode(cond, thenResult, elseResult))
+
 # --- Tagless-final hook ---
 #
 # Any DSL written as Sym[R] (or similar dictionary-passing style) can
