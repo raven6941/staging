@@ -103,6 +103,13 @@ part of this release.
 `smartIf` takes thunked branches: a static condition calls only the selected
 branch, while a dynamic condition calls both and builds one residual node.
 
+Residual while loops use the same thunk discipline: a static-false condition
+folds to `unit()`, while every other condition builds one residual `while`
+node. The condition and body are built once at staging time, so staging-time
+state in the body is not residual loop state. `tests/test_while.nim` emits a
+scanner-shaped sum loop, compiles it in a clean directory, and compares it
+with direct evaluation, including a dynamic zero bound.
+
 ### From staging to runnable code
 
 The complete path from a staged value to a runnable program is demonstrated

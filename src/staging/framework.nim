@@ -153,6 +153,23 @@ proc seqR*(a, b: Rep[Unit],
   else:
     dynamic[Unit](mkNode(a, b))
 
+proc smartWhile*(cond: proc(): Rep[bool], body: proc(): Rep[Unit],
+                 mkNode: proc(c: Rep[bool], b: Rep[Unit]): IRNode): Rep[Unit] =
+  ## Generic staging rule for a residual while loop.
+  ##
+  ## A static-false condition folds the loop to unit without calling the body
+  ## thunk.  Every other condition, including static true, builds one
+  ## residual loop node.  The condition and body are thunks because Nim is
+  ## strict: the body is built once at staging time, verbatim, rather than
+  ## once per residual iteration.  Staging-time state in the body (such as a
+  ## Nim var or table) is therefore touched once; DSL authors must not
+  ## confuse it with residual runtime state.
+  let c = cond()
+  if c.isStatic and not c.staticVal:
+    return unit()
+  let b = body()
+  dynamic[Unit](mkNode(c, b))
+
 # --- Tagless-final hook ---
 #
 # Any DSL written as Sym[R] (or similar dictionary-passing style) can
