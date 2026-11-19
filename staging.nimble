@@ -19,3 +19,4 @@ task test, "Run the self-tests":
   exec "nim c -r --hints:off --path:src tests/test_csp.nim"
   exec "nim c -r --hints:off --path:src tests/test_genlet.nim"
   exec "nim c -r --hints:off --path:src tests/test_traversal.nim"
+  exec "nim c -r --hints:off --path:src tests/test_vars.nim"

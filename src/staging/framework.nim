@@ -38,6 +38,15 @@ type
     staticVal*: T      # valid iff isStatic
     node*: IRNode      # valid iff not isStatic
 
+  Unit* = object
+    ## The value carried by residual statements.
+    discard
+
+  Var*[T] = ref object
+    ## A residual runtime cell. The DSL's node is the cell's declaration and
+    ## the anchor used by its read/write nodes.
+    node*: IRNode
+
 proc lift*[T](x: T): Rep[T] =
   ## Lift a static value into Rep. This is the "static" injection.
   Rep[T](isStatic: true, staticVal: x)
@@ -112,6 +121,37 @@ proc smartIf*[T](cond: Rep[bool],
     let thenResult = thenB()
     let elseResult = elseB()
     dynamic[T](mkNode(cond, thenResult, elseResult))
+
+proc unit*(): Rep[Unit] =
+  ## The pure statement/value used for an empty residual statement.
+  lift(Unit())
+
+proc newVar*[T](init: Rep[T],
+                mkNode: proc(init: Rep[T]): IRNode): Var[T] =
+  ## Allocate a residual cell. Vars are always dynamic: only their init
+  ## expression may be static. Rep[Unit] plus seqR won the statement design
+  ## question: it composes with smartIf while keeping the same Sym vocabulary;
+  ## DSLs that need it can use separate value/statement type parameters.
+  Var[T](node: mkNode(init))
+
+proc readVar*[T](v: Var[T],
+                 mkNode: proc(v: Var[T]): IRNode): Rep[T] =
+  ## Read a runtime cell; reads are deliberately not folded here.
+  dynamic[T](mkNode(v))
+
+proc writeVar*[T](v: Var[T], val: Rep[T],
+                  mkNode: proc(v: Var[T], val: Rep[T]): IRNode): Rep[Unit] =
+  ## Write a runtime cell; no read-after-write optimization is attempted.
+  dynamic[Unit](mkNode(v, val))
+
+proc seqR*(a, b: Rep[Unit],
+           mkNode: proc(a, b: Rep[Unit]): IRNode): Rep[Unit] =
+  ## Sequence two residual statements. Unit is a real staged value so this
+  ## remains usable from a tagless-final Sym without a special void channel.
+  if a.isStatic and b.isStatic:
+    unit()
+  else:
+    dynamic[Unit](mkNode(a, b))
 
 # --- Tagless-final hook ---
 #
