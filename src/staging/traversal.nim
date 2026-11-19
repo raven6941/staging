@@ -20,6 +20,11 @@ type
   ## Compatibility name retained for clients of genlet's original API.
   GenletCallbacks*[T] = TraversalCallbacks[T]
 
+  ## One composite occurrence and the binders visible at that occurrence.
+  GlobalOccurrence*[T] = object
+    node*: T
+    binders*: seq[string]
+
 proc intersects(a: seq[string]; scope: HashSet[string]): bool =
   for name in a:
     if name in scope: return true
@@ -86,3 +91,21 @@ proc occurrences*[T](root: T; cb: TraversalCallbacks[T]): CountTable[string] =
     for child in cb.children(node): walk(child)
   walk(root)
   result = freq
+
+proc globalOccurrences*[T](root: T; cb: TraversalCallbacks[T]):
+    Table[string, seq[GlobalOccurrence[T]]] =
+  ## Global counting counterpart to `occurrences`: do not stop at
+  ## boundaries, and retain each occurrence's binder context.
+  var found = initTable[string, seq[GlobalOccurrence[T]]]()
+  proc walk(node: T; scope: seq[string]) =
+    if cb.isComposite(node) and not cb.isBoundary(node):
+      let k = cb.key(node)
+      found.mgetOrPut(k, @[]).add(GlobalOccurrence[T](node: node,
+        binders: scope))
+    var childScope = scope
+    if cb.isBoundary(node) and not cb.binders.isNil:
+      for name in cb.binders(node):
+        if name notin childScope: childScope.add(name)
+    for child in cb.children(node): walk(child, childScope)
+  walk(root, @[])
+  result = found
