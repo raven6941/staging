@@ -12,3 +12,4 @@ src/staging/traversal
 *.exe
 nimcache/
 tests/test_vars
+tests/test_while
