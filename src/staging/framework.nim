@@ -105,6 +105,27 @@ proc smartLet*[T](bound: Rep[T],
     let bodyResult = body(mkRef())
     dynamic[T](mkNode(bound, bodyResult))
 
+proc smartFun*[A, B](key: string, body: proc(x: Rep[A]): Rep[B],
+                     mkRef: proc(): Rep[proc(x: A): B],
+                     mkArg: proc(): Rep[A],
+                     mkNode: proc(body: Rep[B]): IRNode): Rep[proc(x: A): B] =
+  ## Build one residual function body and return its residual reference.
+  ##
+  ## The keyed registry belongs to the DSL: Nim closures have no reliable
+  ## identity, and only the DSL knows how to type and name its definitions.
+  ## The DSL must publish a reference before calling smartFun, so recursive
+  ## lookups return mkRef() and never re-enter this body builder.  This helper
+  ## owns the common build-once discipline: body is called exactly once per
+  ## registry miss.  The argument reference is a separate node from the
+  ## function reference (mkArg vs mkRef): the parameter binding and the
+  ## function name must stay distinct, or a pass that rewrites one would
+  ## rewrite the other.
+  discard key  # Consumed by the DSL's keyed registry.
+  let refRep = mkRef()
+  let bodyResult = body(mkArg())
+  discard mkNode(bodyResult)
+  refRep
+
 proc smartIf*[T](cond: Rep[bool],
                  thenB, elseB: proc(): Rep[T],
                  mkNode: proc(c: Rep[bool], t, e: Rep[T]): IRNode): Rep[T] =

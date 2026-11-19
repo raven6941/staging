@@ -13,3 +13,4 @@ src/staging/traversal
 nimcache/
 tests/test_vars
 tests/test_while
+tests/test_fun
