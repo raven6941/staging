@@ -13,6 +13,7 @@ requires "nim >= 2.0.0"
 # Tasks
 
 task test, "Run the self-tests":
+  exec "nim c -r --hints:off --path:src tests/test_branch_policy.nim"
   exec "nim c -r --hints:off --path:src tests/test_framework.nim"
   exec "nim c -r --hints:off --path:src tests/test_smartif.nim"
   exec "nim c -r --hints:off --path:src tests/test_codegen.nim"
