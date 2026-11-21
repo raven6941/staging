@@ -4,15 +4,22 @@
 ## Depends on nothing (no Eponym, no relations, no other staging module).
 ##
 ## Design:
-## - `Rep[T]`: staged value. Either static (known now) or dynamic (IR node
-##   for later). The static/dynamic distinction is the essence of staging.
+## - `Rep[T, S]`: staged value. `S` is static by construction along this
+##   code path: true means a staging-time-known value, false means a value
+##   that may require residual IR. The static/dynamic distinction is the
+##   essence of staging.
 ## - `IRNode`: base class for residual IR. DSLs extend with their own nodes.
 ## - `smartOp`: generic smart constructor. Folds when both args static,
 ##   builds IR otherwise. DSLs instantiate with their ops.
 ## - `smartLet`: generic binding constructor. Static bindings are passed
 ##   directly to the body; dynamic bindings get one residual reference and
 ##   one residual let node.
-## - Tagless-final hook: any `Sym[R]` works with `R = Rep[T]`.
+## - Tagless-final hook: any `Sym[R]` works with a uniform `R = Rep[T, S]`.
+##
+## Nim-level `static[T]` means a Nim compile-time constant. `Rep[T, true]`
+## means a staging-time-known value by construction along this code path;
+## these are different notions of static. Combinators that take Nim-level
+## constants say so explicitly in their own signatures.
 ##
 ## This is the "smaller system": no graph IR, no runtime codegen, no
 ## optimization passes. Just binding times + specialization. The DSL
@@ -30,13 +37,14 @@ type
     ## The framework never inspects IRNode — it's opaque residual code.
     discard
 
-  Rep*[T] = ref object
-    ## A staged value of type T.
-    ## - If isStatic: value known at staging time, in staticVal.
-    ## - If not: value known at runtime, represented by node (residual IR).
-    isStatic*: bool
-    staticVal*: T      # valid iff isStatic
-    node*: IRNode      # valid iff not isStatic
+  Rep*[T; S: static[bool] = false] = ref object
+    ## A staged value of type T. `S` guarantees staticness by construction
+    ## along this code path; it does not claim semantic knowledge of every
+    ## staging-time computation.
+    when S:
+      staticVal*: T
+    else:
+      node*: IRNode
 
   Unit* = object
     ## The value carried by residual statements.
@@ -47,68 +55,63 @@ type
     ## the anchor used by its read/write nodes.
     node*: IRNode
 
-proc lift*[T](x: T): Rep[T] =
+proc lift*[T](x: T): Rep[T, true] =
   ## Lift a static value into Rep. This is the "static" injection.
-  Rep[T](isStatic: true, staticVal: x)
+  Rep[T, true](staticVal: x)
 
-proc dynamic*[T](node: IRNode): Rep[T] =
+proc dynamic*[T](node: IRNode): Rep[T, false] =
   ## Wrap a residual IR node as a dynamic Rep. This is the "dynamic" injection.
-  Rep[T](isStatic: false, node: node)
+  Rep[T, false](node: node)
 
-proc getStatic*[T](r: Rep[T]): T =
-  ## Extract static value. Fails if r is dynamic — this is a staging-time
-  ## error (you asked for something static that isn't). If the DSL
-  ## requires staticness here, the type-level spelling is Rep[T, true]
-  ## (staging#9); this assertion is the residual path for values whose
-  ## staticness the types cannot see.
-  assert r.isStatic, "getStatic: Rep is dynamic, not static — the value " &
-    "must be known at staging time; if the DSL requires staticness here, " &
-    "see Rep[T, true] (staging#9)"
+proc getStatic*[T](r: Rep[T, true]): T =
+  ## Extract a value whose staging-time staticness is guaranteed by its type.
+  ## A dynamic argument is rejected by Nim at the call site; the assertion
+  ## path for the old default Rep[T] is intentionally no longer reachable.
   r.staticVal
 
-proc smartOp*[T](a, b: Rep[T],
+proc smartOp*[T; A, B: static[bool]](a: Rep[T, A], b: Rep[T, B],
                  staticOp: proc(x, y: T): T,
-                 mkNode: proc(x, y: Rep[T]): IRNode): Rep[T] =
+                 mkNode: proc(x: Rep[T, A], y: Rep[T, B]): IRNode): Rep[T, A and B] =
   ## Generic smart constructor.
   ## - Both static → compute now (staging-time evaluation).
   ## - Otherwise → build residual IR node (defer to runtime).
   ##
   ## DSLs instantiate this with their operation and node constructor.
   ## This is the single staging rule from which others derive.
-  if a.isStatic and b.isStatic:
+  when A and B:
     lift(staticOp(a.staticVal, b.staticVal))
   else:
     dynamic[T](mkNode(a, b))
 
-proc smartOpUni*[T](a: Rep[T],
+proc smartOpUni*[T; S: static[bool]](a: Rep[T, S],
                     staticOp: proc(x: T): T,
-                    mkNode: proc(x: Rep[T]): IRNode): Rep[T] =
+                    mkNode: proc(x: Rep[T, S]): IRNode): Rep[T, S] =
   ## Unary version of smartOp.
-  if a.isStatic:
+  when S:
     lift(staticOp(a.staticVal))
   else:
     dynamic[T](mkNode(a))
 
-proc smartLet*[T](bound: Rep[T],
-                  body: proc(value: Rep[T]): Rep[T],
-                  mkRef: proc(): Rep[T],
-                  mkNode: proc(bound, body: Rep[T]): IRNode): Rep[T] =
+proc smartLet*[T; S: static[bool]](bound: Rep[T, S],
+                  body: proc(value: Rep[T, S]): Rep[T, S],
+                  mkRef: proc(): Rep[T, false],
+                  mkNode: proc(bound: Rep[T, S], body: Rep[T, S]): IRNode): Rep[T, S] =
   ## Generic staging rule for a tagless-final `letB` operation.
   ##
   ## A direct evaluator can implement `letB` by calling `body(bound)`. A
   ## staged evaluator should use this helper: static bindings are handled by
   ## substitution/folding, while dynamic bindings are shared through one
   ## residual reference and one residual let node.
-  if bound.isStatic:
+  when S:
     body(bound)
   else:
     let bodyResult = body(mkRef())
     dynamic[T](mkNode(bound, bodyResult))
 
-proc smartFun*[A, B](key: string, body: proc(x: Rep[A]): Rep[B],
-                     mkRef: proc(): Rep[proc(x: A): B],
-                     mkArg: proc(): Rep[A],
-                     mkNode: proc(body: Rep[B]): IRNode): Rep[proc(x: A): B] =
+proc smartFun*[A, B; S: static[bool]](key: string, body: proc(x: Rep[A, S]): Rep[B, S],
+                     mkRef: proc(): Rep[proc(x: A): B, false],
+                     mkArg: proc(): Rep[A, S],
+                     mkNode: proc(body: Rep[B, S]): IRNode): Rep[proc(x: A): B, false] =
   ## Build one residual function body and return its residual reference.
   ##
   ## The keyed registry belongs to the DSL: Nim closures have no reliable
@@ -126,14 +129,14 @@ proc smartFun*[A, B](key: string, body: proc(x: Rep[A]): Rep[B],
   discard mkNode(bodyResult)
   refRep
 
-proc smartIf*[T](cond: Rep[bool],
-                 thenB, elseB: proc(): Rep[T],
-                 mkNode: proc(c: Rep[bool], t, e: Rep[T]): IRNode): Rep[T] =
+proc smartIf*[T; C, S: static[bool]](cond: Rep[bool, C],
+                 thenB, elseB: proc(): Rep[T, S],
+                 mkNode: proc(c: Rep[bool, C], t, e: Rep[T, S]): IRNode): Rep[T, C and S] =
   ## Generic staging rule for a residual conditional.
   ##
   ## A static condition evaluates only the selected branch thunk. A dynamic
   ## condition evaluates both branch thunks and builds one residual if node.
-  if cond.isStatic:
+  when C:
     if cond.staticVal:
       thenB()
     else:
@@ -143,12 +146,12 @@ proc smartIf*[T](cond: Rep[bool],
     let elseResult = elseB()
     dynamic[T](mkNode(cond, thenResult, elseResult))
 
-proc unit*(): Rep[Unit] =
+proc unit*(): Rep[Unit, true] =
   ## The pure statement/value used for an empty residual statement.
   lift(Unit())
 
-proc newVar*[T](init: Rep[T],
-                mkNode: proc(init: Rep[T]): IRNode): Var[T] =
+proc newVar*[T; S: static[bool]](init: Rep[T, S],
+                mkNode: proc(init: Rep[T, S]): IRNode): Var[T] =
   ## Allocate a residual cell. Vars are always dynamic: only their init
   ## expression may be static. Rep[Unit] plus seqR won the statement design
   ## question: it composes with smartIf while keeping the same Sym vocabulary;
@@ -156,26 +159,27 @@ proc newVar*[T](init: Rep[T],
   Var[T](node: mkNode(init))
 
 proc readVar*[T](v: Var[T],
-                 mkNode: proc(v: Var[T]): IRNode): Rep[T] =
+                 mkNode: proc(v: Var[T]): IRNode): Rep[T, false] =
   ## Read a runtime cell; reads are deliberately not folded here.
   dynamic[T](mkNode(v))
 
-proc writeVar*[T](v: Var[T], val: Rep[T],
-                  mkNode: proc(v: Var[T], val: Rep[T]): IRNode): Rep[Unit] =
+proc writeVar*[T; S: static[bool]](v: Var[T], val: Rep[T, S],
+                  mkNode: proc(v: Var[T], val: Rep[T, S]): IRNode): Rep[Unit, false] =
   ## Write a runtime cell; no read-after-write optimization is attempted.
   dynamic[Unit](mkNode(v, val))
 
-proc seqR*(a, b: Rep[Unit],
-           mkNode: proc(a, b: Rep[Unit]): IRNode): Rep[Unit] =
+proc seqR*[A, B: static[bool]](a: Rep[Unit, A], b: Rep[Unit, B],
+           mkNode: proc(a: Rep[Unit, A], b: Rep[Unit, B]): IRNode): Rep[Unit, A and B] =
   ## Sequence two residual statements. Unit is a real staged value so this
   ## remains usable from a tagless-final Sym without a special void channel.
-  if a.isStatic and b.isStatic:
+  when A and B:
     unit()
   else:
     dynamic[Unit](mkNode(a, b))
 
-proc smartWhile*(cond: proc(): Rep[bool], body: proc(): Rep[Unit],
-                 mkNode: proc(c: Rep[bool], b: Rep[Unit]): IRNode): Rep[Unit] =
+proc smartWhile*[C, B: static[bool]](cond: proc(): Rep[bool, C],
+                 body: proc(): Rep[Unit, B],
+                 mkNode: proc(c: Rep[bool, C], b: Rep[Unit, B]): IRNode): Rep[Unit, false] =
   ## Generic staging rule for a residual while loop.
   ##
   ## A static-false condition folds the loop to unit without calling the body
@@ -186,8 +190,9 @@ proc smartWhile*(cond: proc(): Rep[bool], body: proc(): Rep[Unit],
   ## Nim var or table) is therefore touched once; DSL authors must not
   ## confuse it with residual runtime state.
   let c = cond()
-  if c.isStatic and not c.staticVal:
-    return unit()
+  when C:
+    if not c.staticVal:
+      return dynamic[Unit](IRNode(nil))
   let b = body()
   dynamic[Unit](mkNode(c, b))
 

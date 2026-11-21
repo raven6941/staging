@@ -16,3 +16,4 @@ tests/test_while
 tests/test_fun
 tests/test_effects
 tests/test_branch_policy
+tests/test_rep_static
