@@ -60,9 +60,9 @@ proc stagedSum(): SumSym[Rep[int], Rep[bool], Rep[Unit], Var[int]] =
   result = SumSym[Rep[int], Rep[bool], Rep[Unit], Var[int]](
     input: proc(name: string): Rep[int] =
       dynamic[int](SumNode(kind: skInput, name: name)),
-    lit: proc(n: int): Rep[int] = lift(n),
+    lit: proc(n: int): Rep[int] = liftNow(n),
     le: proc(a, b: Rep[int]): Rep[bool] =
-      if a.isStatic and b.isStatic: lift(a.staticVal <= b.staticVal)
+      if a.isStatic and b.isStatic: liftNow(a.staticVal <= b.staticVal)
       else: dynamic[bool](SumNode(kind: skLe, left: a, right: b)),
     add: proc(a, b: Rep[int]): Rep[int] = smartOp[int](a, b,
       proc(x, y: int): int = x + y,
@@ -173,7 +173,7 @@ when isMainModule:
   # written through the staged Sym; with it, this test emits and runs it.
   var staticFalseBodyCalls = 0
   let folded = smartWhile(
-    proc(): Rep[bool] = lift(false),
+    proc(): Rep[bool] = liftNow(false),
     proc(): Rep[Unit] = (inc staticFalseBodyCalls; unit()),
     proc(c: Rep[bool], b: Rep[Unit]): IRNode = SumNode(kind: skWhile, cond: c, b: b))
   doAssert folded.isStatic and staticFalseBodyCalls == 0

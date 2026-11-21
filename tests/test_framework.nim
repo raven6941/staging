@@ -105,7 +105,7 @@ proc directArithX(x: int): ArithSym[int] =
 
 proc stagedArith(): ArithSym[Rep[int]] =
   ArithSym[Rep[int]](
-    lit: proc(n: int): Rep[int] = lift(n),
+    lit: proc(n: int): Rep[int] = liftNow(n),
     vr: proc(name: string): Rep[int] = varR(name),
     add: addR,
     mul: mulR,
@@ -189,18 +189,9 @@ when isMainModule:
     "static let bound should fold at staging time"
   echo "ok: static let bound folds to 6"
 
-  # getStatic on a dynamic Rep must fail at staging time, with a
-  # message naming the requirement and the remedy (staging#9 step 1)
-  var raised = false
-  var msg = ""
-  try:
-    discard getStatic(r2)
-  except AssertionDefect:
-    raised = true
-    msg = getCurrentExceptionMsg()
-  doAssert raised, "getStatic on a dynamic Rep should raise"
-  doAssert "staging time" in msg and "Rep[T, true]" in msg,
-    "getStatic failure must name the staging-time requirement and the remedy, got: " & msg
-  echo "ok: getStatic on dynamic Rep raises with requirement + remedy"
+  # Step 2: the remedy is now real; a dynamic Rep is rejected at compile
+  # time, so the step 1 staging-time assertion path is intentionally gone.
+  doAssert not compiles(getStatic(r2))
+  echo "ok: getStatic on dynamic Rep is rejected at compile time"
 
   echo "=== framework is generic: Rep[T], IRNode, lift, dynamic, smartOp only ==="

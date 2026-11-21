@@ -78,8 +78,8 @@ proc compileAndRun(source, exe, dir: string): string =
 when isMainModule:
   # Static condition: only the selected thunk runs and its value is folded.
   var untakenBuilt = false
-  let folded = smartIf[int](lift(true),
-    proc(): Rep[int] = lift(7),
+  let folded = smartIf[int](liftNow(true),
+    proc(): Rep[int] = liftNow(7),
     proc(): Rep[int] =
       untakenBuilt = true
       dynamic[int](ArithNode(kind: akVar, varName: "untaken")),
@@ -90,11 +90,11 @@ when isMainModule:
 
   # Static-false condition folds the other way: the then thunk is untaken.
   var thenBuilt = false
-  let foldedFalse = smartIf[int](lift(false),
+  let foldedFalse = smartIf[int](liftNow(false),
     proc(): Rep[int] =
       thenBuilt = true
       dynamic[int](ArithNode(kind: akVar, varName: "untaken")),
-    proc(): Rep[int] = lift(9),
+    proc(): Rep[int] = liftNow(9),
     proc(c: Rep[bool], t, e: Rep[int]): IRNode =
       ArithNode(kind: akIf, condition: c, thenBranch: t, elseBranch: e))
   doAssert foldedFalse.isStatic and foldedFalse.staticVal == 9
@@ -102,8 +102,8 @@ when isMainModule:
 
   # Dynamic condition: both branches become children of one residual if node.
   let residual = ifR(condR("c"),
-    proc(): Rep[int] = addR(varR("x"), lift(1)),
-    proc(): Rep[int] = mulR(varR("x"), lift(2)))
+    proc(): Rep[int] = addR(varR("x"), liftNow(1)),
+    proc(): Rep[int] = mulR(varR("x"), liftNow(2)))
   doAssert not residual.isStatic
   let ifNode = ArithNode(residual.node)
   doAssert ifNode.kind == akIf
@@ -111,8 +111,8 @@ when isMainModule:
   doAssert ArithNode(ifNode.elseBranch.node).kind == akMul
 
   # A staging-time exception in an untaken branch must never be observed.
-  let safe = smartIf[int](lift(true),
-    proc(): Rep[int] = lift(11),
+  let safe = smartIf[int](liftNow(true),
+    proc(): Rep[int] = liftNow(11),
     proc(): Rep[int] = raise newException(ValueError, "untaken branch built"),
     proc(c: Rep[bool], t, e: Rep[int]): IRNode =
       ArithNode(kind: akIf, condition: c, thenBranch: t, elseBranch: e))
@@ -125,8 +125,8 @@ when isMainModule:
   let directFalse = if false: x + 1 else: x * 2
   doAssert directTrue == 6 and directFalse == 10
   let residualProg = ifR(condR("c"),
-    proc(): Rep[int] = addR(varR("x"), lift(1)),
-    proc(): Rep[int] = mulR(varR("x"), lift(2)))
+    proc(): Rep[int] = addR(varR("x"), liftNow(1)),
+    proc(): Rep[int] = mulR(varR("x"), liftNow(2)))
   for cVal in [true, false]:
     let generated = "let c = " & $cVal & "\nlet x = " & $x &
       "\nwhen isMainModule:\n  echo " & emitInt(residualProg) & "\n"

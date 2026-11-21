@@ -58,12 +58,12 @@ proc stagedCount(): CountSym[Rep[int], Rep[bool], Rep[Unit], Var[int]] =
   CountSym[Rep[int], Rep[bool], Rep[Unit], Var[int]](
     input: proc(name: string): Rep[int] =
       dynamic[int](CountNode(kind: ckInput, name: name)),
-    lit: proc(n: int): Rep[int] = lift(n),
+    lit: proc(n: int): Rep[int] = liftNow(n),
     gt: proc(a, b: Rep[int]): Rep[bool] =
-      if a.isStatic and b.isStatic: lift(a.staticVal > b.staticVal)
+      if a.isStatic and b.isStatic: liftNow(a.staticVal > b.staticVal)
       else: dynamic[bool](CountNode(kind: ckGt, left: a, right: b)),
     andB: proc(a, b: Rep[bool]): Rep[bool] =
-      if a.isStatic and b.isStatic: lift(a.staticVal and b.staticVal)
+      if a.isStatic and b.isStatic: liftNow(a.staticVal and b.staticVal)
       else: dynamic[bool](CountNode(kind: ckAnd, bl: a, br: b)),
     add: proc(a, b: Rep[int]): Rep[int] = smartOp[int](a, b,
       proc(x, y: int): int = x + y,

@@ -44,6 +44,17 @@ when isMainModule:
   doAssert not compiles(getStatic(mixed))
   doAssert mixed is Rep[int, false]
 
+  # Hybrid pin: folding is driven by the runtime flag, not by S. liftNow
+  # values carry no type-level promise (S = false), yet smartOp folds them
+  # because the flag says they are static.
+  let flagFolded = addR(liftNow(1), liftNow(2))
+  doAssert flagFolded is Rep[int, false]
+  doAssert flagFolded.isStatic and flagFolded.staticVal == 3
+  doAssert not compiles(getStatic(flagFolded))
+  # A genuinely dynamic operand still does not fold.
+  let flagDyn = addR(liftNow(1), dyn("x"))
+  doAssert not flagDyn.isStatic
+
   # Vetting stencil port, stencil.nim lines 95-103: the old dynamic
   # getStatic(nDyn) staging-time assertion is now a compile-time rejection.
   let dynRep: Rep[int] = dyn("dynamic")
