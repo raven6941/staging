@@ -64,7 +64,7 @@ proc stagedFunSym(state: FunState): FunSym[Rep[int], Rep[bool], Rep[proc(x: int)
   result = FunSym[Rep[int], Rep[bool], Rep[proc(x: int): int]](
     input: proc(name: string): Rep[int] =
       dynamic[int](FunNode(kind: fkInput, name: name)),
-    lit: proc(n: int): Rep[int] = lift(n),
+    lit: proc(n: int): Rep[int] = liftNow(n),
     add: proc(a, b: Rep[int]): Rep[int] = smartOp[int](a, b,
       proc(x, y: int): int = x + y,
       proc(x, y: Rep[int]): IRNode = FunNode(kind: fkAdd, left: x, right: y)),
@@ -75,7 +75,7 @@ proc stagedFunSym(state: FunState): FunSym[Rep[int], Rep[bool], Rep[proc(x: int)
       proc(x, y: int): int = x * y,
       proc(x, y: Rep[int]): IRNode = FunNode(kind: fkMul, left: x, right: y)),
     eq: proc(a, b: Rep[int]): Rep[bool] =
-      if a.isStatic and b.isStatic: lift(a.staticVal == b.staticVal)
+      if a.isStatic and b.isStatic: liftNow(a.staticVal == b.staticVal)
       else: dynamic[bool](FunNode(kind: fkEq, eqLeft: a, eqRight: b)),
     ifB: proc(c: Rep[bool], t, e: proc(): Rep[int]): Rep[int] =
       smartIf[int](c, t, e,

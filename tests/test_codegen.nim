@@ -34,7 +34,7 @@ proc directArith(x: int): ArithSym[int] =
 
 proc stagedArith(): ArithSym[Rep[int]] =
   ArithSym[Rep[int]](
-    lit: proc(n: int): Rep[int] = lift(n),
+    lit: proc(n: int): Rep[int] = liftNow(n),
     vr: proc(name: string): Rep[int] =
       dynamic[int](ArithNode(kind: akVar, varName: name)),
     add: proc(a, b: Rep[int]): Rep[int] =
