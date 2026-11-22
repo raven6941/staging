@@ -35,7 +35,7 @@ no optimization passes — except one, `genlet`.
 |---|---|
 | `staging/framework` | `Rep[T]`, `IRNode`, `lift`, `dynamic`, `smartOp` / `smartOpUni`, `smartLet`, `smartIf`, residual `Var[T]` cells with `readVar` / `writeVar`, `Rep[Unit]` statements with `seqR`, and the tagless-final hook. No imports at all. |
 | `staging/csp` | Cross-stage persistence registry: declare every present-stage name the residual may reference, emit it only via `lift`, derive the residual's import block from the registry. No imports at all. |
-| `staging/genlet` | Residual let-insertion over `GTree`, or directly over a client IR through callbacks: common-subterm elimination with residual `let` binders, gated by a node-savings test. Stdlib only (`tables`, `sequtils`, `strutils`). |
+| `staging/genlet` | Residual let-insertion over `GTree`, or directly over a client IR through callbacks: common-subterm elimination with residual `let` binders, hoisting every repeated pure composite with at least 3 nodes. Stdlib only (`tables`, `sequtils`, `strutils`). |
 | `staging/branch_policy` | Decision vocabulary for staged relational branching: tri-state outcomes, per-site gather/fallback/later policies with gather bounds, and residual plans including prune/refuse. Stdlib only (`tables`). |
 
 ## Worked example: staging an arithmetic evaluator
@@ -138,17 +138,17 @@ printer.
 ### genlet: sharing the residual
 
 A stager that duplicates a shared computation pays for it twice at runtime.
-`genlet` hoists a repeated composite subterm under one residual `let`
+`genlet` hoists repeated pure composites under residual `let`s
 (`tests/test_genlet.nim`, actual output):
 
 ```
 before: add(mul(add(x, 1), add(y, 2)), add(mul(add(x, 1), add(y, 2)), mul(add(x, 1), add(y, 2))))
-after:  (let genlet0 = mul(add(x, 1), add(y, 2)) in add(genlet0, add(genlet0, genlet0)))
+after:  (let genlet1 = add(y, 2) in (let genlet0 = add(x, 1) in (let genlet2 = mul(genlet0, genlet1) in add(genlet2, add(genlet2, genlet2)))))
 ```
 
-The shared 7-node term, used 3 times (23 nodes total), becomes one binding
-plus three placeholders (13 nodes). The pass is gated by a savings test —
-a term shared only twice never qualifies — and it never hoists across a
+The shared 7-node term, used 3 times (23 nodes total), becomes three bindings
+plus three placeholders (17 nodes). The pass hoists any repeated pure
+composite with at least 3 nodes, and it never hoists across a
 `let` binder. Evaluation before and after agrees (45 with x=2, y=3).
 
 ### csp: what the residual may name
@@ -199,7 +199,7 @@ Honest boundaries, not roadmap promises:
   structural keys, rebuilding, binder-reference construction, and residual
   let construction. Use the callback form to avoid copying or mapping the IR
   to `GTree`; use `GTree` when the generic representation is simpler. Both
-  forms use the same savings test, treat `let` binders as sharing boundaries,
+  forms use the same work-based hoisting rule, treat `let` binders as sharing boundaries,
   and honor `isPure`: nil means pure, while false marks a sharing boundary.
   The classification's long-term home (callbacks or a framework-level node
   tag) remains open until another consumer needs it.

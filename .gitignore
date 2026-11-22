@@ -17,3 +17,8 @@ tests/test_fun
 tests/test_effects
 tests/test_branch_policy
 tests/test_rep_static
+tests/test_arrays
+tests/test_structs
+tests/test_hoas
+tests/test_anf
+tests/test_modes
