@@ -30,6 +30,19 @@
 ## - ccStdlib: standard-library procs referenced by name; qualified where
 ##   the module is explicit, declared where it is ambient (`system`).
 ##
+## Engine-reference pattern (staging#3 step 4): a staged relational
+## residual declares its engine — the unstaged interpreter the residual
+## falls back to at runtime (e.g. `minikanren.run`, `freshVar`, the
+## unstaged relation itself) — as `ccEngine`, and the residual is
+## deliberately NOT closed under this policy: dynamic search persists as a
+## runtime dependency, declared in the emitted import block. The invariant
+## is that every fallback site is a declared engine reference: a
+## `bpFallback` plan (see `branch_policy.resolveBranch`) whose dynamic call
+## is not a declared `ccEngine` ref is a generator bug, caught at
+## generation time — `lift` raises on undeclared names, so the residual is
+## never emitted with a silent unclosed reference — and by the
+## `cspUnused`/free-vars checks below.
+##
 ## Invariants checked by tests/test_csp.nim:
 ## - every declared ref is used at least once (no dead declarations);
 ## - the residual's import block equals the registry-derived set;
@@ -38,6 +51,9 @@
 ## - every unqualified identifier in the residual is a Nim keyword, a
 ##   residual-local binding, a residual-defined proc/type, or a declared
 ##   unqualified name.
+## - every fallback plan's dynamic call is a declared `ccEngine` ref
+##   (staging#3 step 4); a fallback with no such declaration raises at
+##   generation time instead of emitting an unclosed residual.
 ##
 ## Origin: extracted from Eponym's `src/experimental/staging/csp.nim`
 ## (the Issue #75 policy for the staged relational elaborator's residual).
