@@ -21,15 +21,12 @@
 ## subterm `t` is rewritten to a `let` binding `t` once and substituting
 ## a placeholder atom for every occurrence.)
 ##
-## When to insert: pure savings test, carried over unchanged from the
-## original. Replacing n occurrences of a term of s nodes with placeholders
-## removes (n-1)*(s-1) term nodes and adds the residual equation (s+1 term
-## nodes, ~3 extra nodes for the equation, the binder, and the added
-## structure). Hoist only when the net is positive; this self-calibrates —
-## on residuals with no real composite duplication, nothing qualifies and
-## the pass is a no-op. Note the arithmetic: with n = 2 the saving is
-## always -4, so a term shared only twice never qualifies; sharing pays
-## from n = 3 with a term of at least 6 nodes.
+## When to insert: hoist any repeated pure composite with n >= 2 occurrences
+## and s >= 3 nodes. The true node change is delta = -n*(s-1) + s + 1,
+## which is <= 0 for those candidates: strictly negative except for the
+## single boundary case n = 2, s = 3, where delta = 0. The cost is explicit:
+## one residual let per repeated pure composite (runtime work takes priority
+## over code size; Aaron's ruling, 2026-11-22).
 ##
 ## Sharing boundaries: let nodes are scope-checked boundaries, not absolute
 ## counting/substitution boundaries. When freeVars is supplied, occurrences
@@ -169,9 +166,12 @@ proc insertLets*(g: GTree; ctx: var GenletCtx): GTree =
   ## Hoist at each node before recursing into its children (see
   ## callbackInsert), so a candidate spanning several children is
   ## decided while its count is still whole. Loops per node because one
-  ## hoist can reveal the next candidate; each hoist strictly reduces
-  ## node count — the savings test implies a true change of
-  ## -(n-1)*(s-1) + 2 < 0 — so the loop terminates.
+  ## hoist can reveal the next candidate; each hoist either strictly reduces
+  ## node count, or (n = 2, s = 3, delta = 0) leaves node count unchanged
+  ## while dropping that term's occurrence count from 2 to 1 without
+  ## creating new copies of any term. The lexicographic measure (node count,
+  ## number of repeated composites) strictly decreases, so the loop
+  ## terminates.
   var cb = gtreeCallbacks()
   insertLetsCb(g, ctx, cb)
 
@@ -216,13 +216,13 @@ proc callbackHoist[T](node: T; ctx: var GenletCtx;
 
   var bestKey = ""
   var bestSize = 0
-  var bestSave = 0
+  var bestDelta = 0
   for k, n in freq:
     if n > 1:
       let size = callbackSize(sample[k], cb)
-      let save = (n - 1) * (size - 1) - size - 3
-      if save <= 0:
+      if size < 3:
         continue
+      let delta = -n * (size - 1) + size + 1
       # A pure candidate containing an effect must never be hoisted:
       # sharing it would execute the effect fewer times.
       if containsEffect(sample[k], cb):
@@ -239,18 +239,19 @@ proc callbackHoist[T](node: T; ctx: var GenletCtx;
       # collapses the counts of the terms inside it (their copies are
       # replaced by the new reference, leaving only the bound copy), so
       # a larger term hoisted first can push a smaller shared term below
-      # the savings threshold before the pass ever sees it at the shared
+      # n = 2 occurrence threshold before the pass ever sees it at the shared
       # site (stencil: wm(2)/wm(3) hoisted first leave mul(a2,a3) at 4
-      # occurrences, saving exactly 0). Hoisting the smaller term first
+      # occurrences, which still qualifies under the work-based rule).
+      # Hoisting the smaller term first
       # leaves larger terms' counts untouched — their copies change
-      # identically — so nothing is lost. Ties break by greatest saving,
-      # then by key, so placement is deterministic.
+      # identically — so nothing is lost. Ties break by most negative true
+      # delta, then by key, so placement is deterministic.
       if bestKey == "" or size < bestSize or
-          (size == bestSize and save > bestSave) or
-          (size == bestSize and save == bestSave and k < bestKey):
+          (size == bestSize and delta < bestDelta) or
+          (size == bestSize and delta == bestDelta and k < bestKey):
         bestKey = k
         bestSize = size
-        bestSave = save
+        bestDelta = delta
   if bestKey == "":
     return node
 

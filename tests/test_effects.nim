@@ -1,8 +1,8 @@
 ## Step 4: minimal effect annotations.
 ##
 ## The load-bearing genlet case below fails without the isPure wiring: the
-## repeated effectful composite qualifies on savings and is hoisted. With the
-## wiring it remains three separate occurrences. Traversal still visits its
+## repeated effectful composite qualifies under the work-based rule and is
+## hoisted. With the wiring it remains three separate occurrences. Traversal still visits its
 ## children, because effect annotations are sharing boundaries, not opaque
 ## nodes.
 
@@ -85,7 +85,7 @@ when isMainModule:
   doAssert boundReads == 1
   echo "ok: smartLet makes power(read(), 4) perform one read"
 
-  # This effectful composite would qualify under the savings test if pure.
+  # This effectful composite would qualify under the work-based rule if pure.
   let effect = gnode("read", @[
     gnode("add", @[gatom("2"), gatom("3")]),
     gnode("add", @[gatom("4"), gatom("5")])])
@@ -104,7 +104,7 @@ when isMainModule:
   let pureRepeated = gnode("add", @[pure, gnode("add", @[pure, pure])])
   var pureCtx = newGenletCtx()
   discard insertLetsCb(pureRepeated, pureCtx, gtreeCallbacks())
-  doAssert pureCtx.counter == 1
+  doAssert pureCtx.counter == 3
   echo "ok: effectful composite is not hoisted; pure twin is"
 
   # Traversal is still structural and sees through the effectful node.
@@ -141,7 +141,7 @@ when isMainModule:
   let containsTree = gnode("add", @[inner, gnode("add", @[inner, inner])])
   var containCtx = newGenletCtx()
   let containOut = insertLetsCb(containsTree, containCtx, effCb2)
-  doAssert containCtx.counter == 0
+  doAssert containCtx.counter == 1
   doAssert count($containOut, "read(a, b)") == 3
 
   # Pure twin: same shape, no effect — the candidate IS hoisted.
@@ -150,6 +150,6 @@ when isMainModule:
   let pureContains = gnode("add", @[pinner, gnode("add", @[pinner, pinner])])
   var pureContainCtx = newGenletCtx()
   discard insertLetsCb(pureContains, pureContainCtx, gtreeCallbacks())
-  doAssert pureContainCtx.counter == 1
+  doAssert pureContainCtx.counter == 3
   echo "ok: pure candidate containing an effect is not hoisted; pure twin is"
 
