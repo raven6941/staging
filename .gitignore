@@ -3,6 +3,7 @@ tests/test_framework
 tests/test_csp
 tests/test_genlet
 tests/test_relgenlet
+tests/test_partial_deduction
 tests/test_codegen
 tests/test_traversal
 tests/test_smartif
