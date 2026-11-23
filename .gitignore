@@ -25,3 +25,4 @@ tests/test_hoas
 tests/test_anf
 tests/test_modes
 tests/test_regex
+tests/test_stream
