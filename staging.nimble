@@ -38,6 +38,7 @@ task test, "Run the self-tests":
   exec "nim c -r --hints:off --path:src tests/test_shonan.nim"
   exec "nim c -r --hints:off --path:src tests/test_query.nim"
   exec "nim c -r --hints:off --path:src tests/test_arrays.nim"
+  exec "nim c -r --hints:off --path:src tests/test_stencil.nim"
   exec "nim c -r --hints:off --path:src tests/test_structs.nim"
   exec "nim c -r --hints:off --path:src tests/test_complex.nim"
   exec "nim c -r --hints:off --path:src tests/test_union.nim"
