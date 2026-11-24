@@ -12,6 +12,7 @@ src/staging/csp
 src/staging/genlet
 src/staging/traversal
 *.exe
+tests/test_tpch_q1
 nimcache/
 tests/test_vars
 tests/test_while
