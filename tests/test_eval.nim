@@ -31,10 +31,13 @@ type
     body: Term
     env: Table[string, Value]
     code: Rep[Value]
+    f: proc(arg: Value): Value
 
   Env = Table[string, Value]
   Def = object
     name: string
+    param: string
+    parent: string
     body: Rep[Value]
   SKind = enum skArg, skPrim, skIf, skCall, skFallback
   SNode = ref object of IRNode
@@ -51,6 +54,7 @@ type
     nextId: int
     defs: seq[Def]
     refs: Table[string, string]
+    stack: seq[string]
 
 proc I(n: int): Term = Term(kind: tkI, n: n)
 proc B(x: bool): Term = Term(kind: tkB, b: x)
@@ -140,7 +144,7 @@ proc emitVal(v: Value): string =
   of vkI: "vi(" & $v.n & ")"
   of vkB: "vb(" & $v.b & ")"
   of vkP: "vp(\"" & v.name & "\")"
-  of vkEvalfun: "vf(\"" & v.name & "\")"
+  of vkEvalfun: "vf(" & v.name & ")"
   of vkClo: "vc(\"" & v.param & "\", " & emitTerm(v.body) & ", " & envText(v.env) & ")"
   of vkCode: emitValue(v.code)
 
@@ -154,7 +158,7 @@ proc emitValue(r: Rep[Value]): string =
   if r.isStatic: return emitVal(r.staticVal)
   let n = SNode(r.node)
   case n.kind
-  of skArg: "arg"
+  of skArg: n.p
   of skPrim:
     if n.p == "true": "(not (" & emitValue(n.left) & ".kind == vkB and not " & emitValue(n.left) & ".b))"
     else: "base_apply_norep(vp(\"" & n.p & "\"), @[" & emitValue(n.left) & ", " & emitValue(n.right) & "], initTable[string, Value]())"
@@ -165,9 +169,17 @@ proc emitValue(r: Rep[Value]): string =
 proc makeFun(st: SState, key: string, body: proc(x: Rep[Value]): Rep[Value]): Value =
   if st.refs.hasKey(key): return vf(st.refs[key])
   let name = "eval_" & $st.nextId; inc st.nextId
+  let param = "arg" & $st.nextId; inc st.nextId
+  let parent = if st.stack.len == 0: "" else: st.stack[^1]
   st.refs[key] = name # publish before entering recursive body construction
-  let r = body(dynamic[Value](SNode(kind: skArg)))
-  st.defs.add(Def(name: name, body: r))
+  st.defs.add(Def(name: name, param: param, parent: parent))
+  st.stack.add(name)
+  let r = body(dynamic[Value](SNode(kind: skArg, p: param)))
+  st.stack.setLen(st.stack.len - 1)
+  for i in 0 ..< st.defs.len:
+    if st.defs[i].name == name:
+      st.defs[i].body = r
+      break
   vf(name)
 
 proc stagedEval(t: Term, env: Env, st: SState, k: proc(x: Rep[Value]): Rep[Value]): Rep[Value]
@@ -183,7 +195,7 @@ proc stagedArgs(ts: seq[Term], i: int, env: Env, st: SState, k: proc(xs: seq[Rep
 
 proc stagedApply(f: Rep[Value], xs: seq[Rep[Value]], env: Env, st: SState): Rep[Value] =
   if f.isStatic and f.staticVal.kind == vkEvalfun:
-    return dynamic[Value](SNode(kind: skCall, name: f.staticVal.name, arg: xs[0]))
+    return dynamic[Value](SNode(kind: skFallback, f: f, arg: xs[0], env: env))
   if f.isStatic and f.staticVal.kind == vkP and xs.allIt(it.isStatic):
     return liftNow(prim(f.staticVal.name, xs.mapIt(it.staticVal)))
   if f.isStatic and f.staticVal.kind == vkP:
@@ -202,12 +214,6 @@ proc stagedEval(t: Term, env: Env, st: SState, k: proc(x: Rep[Value]): Rep[Value
     if not t.compile: k(liftNow(vc(t.param, t.body, env)))
     else: k(liftNow(makeFun(st, t.param & "_" & $st.nextId, proc(arg: Rep[Value]): Rep[Value] =
       var ce = codeEnv(env, t.param, arg)
-      # When a compiled lambda immediately contains another compiled lambda,
-      # its parameter is the recursive function value at the inner boundary.
-      # Preserve that Evalfun identity instead of confusing it with the inner
-      # lambda's own argument.
-      if t.body.kind == tkL and t.body.compile and (t.param == "fib" or t.param == "sumf"):
-        ce[t.param] = vf("eval_" & $st.nextId)
       stagedEval(t.body, ce, st, proc(x: Rep[Value]): Rep[Value] = x))))
   of tkA:
     stagedEval(t.fn, env, st, proc(f: Rep[Value]): Rep[Value] =
@@ -230,7 +236,7 @@ proc runtimePrelude(defs: seq[Def]): string =
     "type TermKind = enum tkI, tkB, tkV, tkP, tkL, tkA, tkIf\n" &
     "type Term = ref object\n  kind: TermKind\n  n: int\n  b: bool\n  s: string\n  compile: bool\n  param: string\n  body: Term\n  fn: Term\n  args: seq[Term]\n  c, yes, no: Term\n" &
     "type ValueKind = enum vkI, vkB, vkP, vkClo, vkEvalfun\n" &
-    "type Value = ref object\n  kind: ValueKind\n  n: int\n  b: bool\n  name: string\n  param: string\n  body: Term\n  env: Table[string, Value]\n" &
+    "type Value = ref object\n  kind: ValueKind\n  n: int\n  b: bool\n  name: string\n  param: string\n  body: Term\n  env: Table[string, Value]\n  f: proc(arg: Value): Value\n" &
     "type Env = Table[string, Value]\n" &
     "proc I(n:int):Term = Term(kind: tkI, n: n)\nproc B(b:bool):Term = Term(kind: tkB, b: b)\n" &
     "proc V(s:string):Term = Term(kind: tkV, s: s)\nproc P(s:string):Term = Term(kind: tkP, s: s)\n" &
@@ -238,22 +244,14 @@ proc runtimePrelude(defs: seq[Def]): string =
     "proc A(f:Term,xs:varargs[Term]):Term = Term(kind: tkA, fn: f, args: @xs)\n" &
     "proc If(c,t,e:Term):Term = Term(kind: tkIf, c: c, yes: t, no: e)\n" &
     "proc vi(n:int):Value = Value(kind: vkI, n: n)\nproc vb(b:bool):Value = Value(kind: vkB, b: b)\n" &
-    "proc vp(s:string):Value = Value(kind: vkP, name: s)\nproc vf(s:string):Value = Value(kind: vkEvalfun, name: s)\n" &
+    "proc vp(s:string):Value = Value(kind: vkP, name: s)\n" &
     "proc vc(p:string,b:Term,e:Env):Value = Value(kind: vkClo, param: p, body: b, env: e)\n" &
+    "proc vf(f:proc(arg:Value):Value):Value = Value(kind: vkEvalfun, f: f)\n" &
     "proc putEnv(e:Env,k:string,v:Value):Env =\n  result = e\n  result[k] = v\n" &
     "proc choose(c:bool,a,b:proc():Value):Value =\n  if c: a() else: b()\n" &
     "proc prim(p:string,x:seq[Value]):Value =\n  case p\n" &
     "    of \"<\": vb(x[0].n < x[1].n)\n    of \"+\": vi(x[0].n + x[1].n)\n" &
     "    of \"-\": vi(x[0].n - x[1].n)\n    else: raise newException(ValueError, \"unknown primitive\")\n"
-  for d in defs:
-    result &= "proc " & d.name & "(arg: Value): Value\n"
-  if defs.len == 0:
-    result &= "proc callEvalfun(name:string,arg:Value):Value = raise newException(ValueError, \"unknown evalfun\")\n"
-  else:
-    result &= "proc callEvalfun(name:string,arg:Value):Value =\n  case name\n"
-    for d in defs:
-      result &= "    of \"" & d.name & "\": " & d.name & "(arg)\n"
-    result &= "    else: raise newException(ValueError, \"unknown evalfun\")\n"
   result &= "proc base_eval(t:Term,e:Env):Value\nproc base_apply_norep(f:Value,x:seq[Value],e:Env):Value\n" &
     "proc base_eval(t:Term,e:Env):Value =\n  case t.kind\n" &
     "    of tkI: vi(t.n)\n    of tkB: vb(t.b)\n    of tkP: vp(t.s)\n" &
@@ -262,14 +260,27 @@ proc runtimePrelude(defs: seq[Def]): string =
     "    of tkA: base_apply_norep(base_eval(t.fn,e), t.args.mapIt(base_eval(it,e)), e)\n"
   result &= "proc applyClo(f:Value,x:seq[Value]):Value =\n  var z = initTable[string,Value]()\n  for k,v in f.env: z[k] = v\n  z[f.param] = x[0]\n  base_eval(f.body,z)\n" &
     "proc base_apply_norep(f:Value,x:seq[Value],e:Env):Value =\n  case f.kind\n" &
-    "    of vkP: prim(f.name,x)\n    of vkEvalfun: callEvalfun(f.name,x[0])\n" &
+    "    of vkP: prim(f.name,x)\n    of vkEvalfun: f.f(x[0])\n" &
     "    of vkClo: applyClo(f,x)\n" &
     "    else: raise newException(ValueError, \"not callable\")\n"
 
 proc residualProgram(r: Rep[Value], st: SState): string =
   result = runtimePrelude(st.defs)
-  for d in st.defs:
-    result &= "proc " & d.name & "(arg: Value): Value = " & emitValue(d.body) & "\n"
+  proc emitBody(i: int, indent: string): string =
+    let d = st.defs[i]
+    for j, child in st.defs:
+      if child.parent == d.name:
+        result &= indent & "var " & child.name & ": proc(" & child.param & ": Value): Value\n"
+    for j, child in st.defs:
+      if child.parent == d.name:
+        result &= indent & child.name & " = proc(" & child.param & ": Value): Value =\n"
+        result &= emitBody(j, indent & "  ")
+    result &= indent & emitValue(d.body) & "\n"
+    result
+  for i, d in st.defs:
+    if d.parent.len == 0:
+      result &= "proc " & d.name & "(" & d.param & ": Value): Value =\n"
+      result &= emitBody(i, "  ")
   result &= "when isMainModule:\n  echo " & emitValue(r) & ".n\n"
 
 proc compileRun(src, exe, dir: string): string =
