@@ -26,3 +26,4 @@ tests/test_anf
 tests/test_modes
 tests/test_regex
 tests/test_stream
+tests/test_vectorops
