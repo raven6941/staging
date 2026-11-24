@@ -32,5 +32,6 @@ tests/test_stream
 tests/test_vectorops
 tests/test_vecarith
 tests/test_lowering
+tests/test_fusion
 tests/test_shonan
 tests/test_query
