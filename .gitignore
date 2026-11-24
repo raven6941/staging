@@ -45,3 +45,4 @@ tests/test_fusion_reduce
 tests/test_fusion_horizontal
 tests/test_shonan
 tests/test_query
+tests/test_veccomplex_arith
