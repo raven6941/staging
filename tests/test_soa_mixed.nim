@@ -2,24 +2,29 @@
 
 import staging/framework
 import staging/arrays
-import std/[math, os, osproc, sequtils, strutils, times]
+import std/[math, os, osproc, sequtils, strutils]
+when isMainModule:
+  import std/times
 
 type
-  ClassTag = enum ctCartesian, ctPolar
-  Complex = object
-    re, im, r, theta: float
-    clzz: ClassTag
-  VectorComplex = object
+  ClassTag* = enum ctCartesian, ctPolar
+  Complex* = object
+    re*, im*, r*, theta*: float
+    clzz*: ClassTag
+  VectorComplex* = object
     re, im, r, theta: Arr[float]
     clzz: Arr[ClassTag]
     length: Rep[int]
     mapped: bool
+    cartesianOnly: bool
   StagedComplex = object
     re, im, r, theta: Rep[float]
     clzz: Rep[ClassTag]
+    cartesianOnly: bool
   ConjPart = enum cpRe, cpIm
   Column = enum colRe, colIm, colR, colTheta, colClzz
-  MixedKind = enum mkInputF, mkInputTag, mkLen, mkReadF, mkReadTag, mkConjF
+  MixedKind = enum mkInputF, mkInputTag, mkLen, mkReadF, mkReadTag, mkConjF,
+    mkCartF, mkAddF, mkScaleF
   MixedNode = ref object of IRNode
     kind: MixedKind
     name: string
@@ -30,10 +35,12 @@ type
     index: Rep[int]
     source: StagedComplex
     part: ConjPart
+    left, right: StagedComplex
+    scalar: Rep[float]
 
-proc inputF(name: string, values: seq[float]): Arr[float] =
+proc inputF*(name: string, values: seq[float]): Arr[float] =
   Arr[float](node: MixedNode(kind: mkInputF, name: name, fdata: values))
-proc inputTag(name: string, values: seq[ClassTag]): Arr[ClassTag] =
+proc inputTag*(name: string, values: seq[ClassTag]): Arr[ClassTag] =
   Arr[ClassTag](node: MixedNode(kind: mkInputTag, name: name, tdata: values))
 proc length(a: Arr[float]): Rep[int] = lenArr[float](a,
   proc(x: Arr[float]): IRNode = MixedNode(kind: mkLen, farr: x))
@@ -42,33 +49,56 @@ proc readF(a: Arr[float], i: Rep[int]): Rep[float] = readArr[float](a, i,
 proc readTag(a: Arr[ClassTag], i: Rep[int]): Rep[ClassTag] = readArr[ClassTag](a, i,
   proc(x: Arr[ClassTag], j: Rep[int]): IRNode = MixedNode(kind: mkReadTag, tarr: x, index: j))
 
-proc mixedVector(re, im, r, theta: Arr[float], clzz: Arr[ClassTag]): VectorComplex =
-  VectorComplex(re: re, im: im, r: r, theta: theta, clzz: clzz, length: length(im))
+proc mixedVector*(re, im, r, theta: Arr[float], clzz: Arr[ClassTag]): VectorComplex =
+  let tags = MixedNode(clzz.node).tdata
+  VectorComplex(re: re, im: im, r: r, theta: theta, clzz: clzz, length: length(im),
+    cartesianOnly: tags.allIt(it == ctCartesian))
 proc rawAt(v: VectorComplex, i: Rep[int]): StagedComplex =
   StagedComplex(re: readF(v.re, i), im: readF(v.im, i), r: readF(v.r, i),
-    theta: readF(v.theta, i), clzz: readTag(v.clzz, i))
+    theta: readF(v.theta, i), clzz: readTag(v.clzz, i), cartesianOnly: v.cartesianOnly)
 proc conjPart(c: StagedComplex, part: ConjPart): Rep[float] =
   dynamic[float](MixedNode(kind: mkConjF, source: c, part: part))
 proc conj(c: StagedComplex): StagedComplex =
   StagedComplex(re: conjPart(c, cpRe), im: conjPart(c, cpIm), r: liftNow(0.0),
-    theta: liftNow(0.0), clzz: liftNow(ctCartesian))
+    theta: liftNow(0.0), clzz: liftNow(ctCartesian), cartesianOnly: false)
 proc at(v: VectorComplex, i: Rep[int]): StagedComplex =
   if v.mapped: conj(rawAt(v, i)) else: rawAt(v, i)
 proc mapConj(v: VectorComplex): VectorComplex =
   VectorComplex(re: v.re, im: v.im, r: v.r, theta: v.theta, clzz: v.clzz,
-    length: v.length, mapped: true)
+    length: v.length, mapped: true, cartesianOnly: v.cartesianOnly)
+
+proc cartPart(c: StagedComplex, part: ConjPart): Rep[float] =
+  if c.cartesianOnly:
+    if part == cpRe: c.re else: c.im
+  else:
+    dynamic[float](MixedNode(kind: mkCartF, source: c, part: part))
+
+proc addComplex*(a, b: StagedComplex): StagedComplex =
+  StagedComplex(re: dynamic[float](MixedNode(kind: mkAddF, left: a, right: b, part: cpRe)),
+    im: dynamic[float](MixedNode(kind: mkAddF, left: a, right: b, part: cpIm)),
+    r: liftNow(0.0), theta: liftNow(0.0), clzz: liftNow(ctCartesian))
+proc scalarComplex*(s: Rep[float], a: StagedComplex): StagedComplex =
+  StagedComplex(re: dynamic[float](MixedNode(kind: mkScaleF, source: a, scalar: s, part: cpRe)),
+    im: dynamic[float](MixedNode(kind: mkScaleF, source: a, scalar: s, part: cpIm)),
+    r: liftNow(0.0), theta: liftNow(0.0), clzz: liftNow(ctCartesian))
+proc addAt*(a, b: VectorComplex, i: Rep[int]): StagedComplex =
+  addComplex(StagedComplex(re: cartPart(rawAt(a, i), cpRe), im: cartPart(rawAt(a, i), cpIm),
+    r: liftNow(0.0), theta: liftNow(0.0), clzz: liftNow(ctCartesian)),
+    StagedComplex(re: cartPart(rawAt(b, i), cpRe), im: cartPart(rawAt(b, i), cpIm),
+      r: liftNow(0.0), theta: liftNow(0.0), clzz: liftNow(ctCartesian)))
+proc scalarAt*(s: Rep[float], a: VectorComplex, i: Rep[int]): StagedComplex =
+  scalarComplex(s, StagedComplex(re: cartPart(rawAt(a, i), cpRe), im: cartPart(rawAt(a, i), cpIm),
+    r: liftNow(0.0), theta: liftNow(0.0), clzz: liftNow(ctCartesian)))
 
 proc floatName(a: Arr[float]): string = MixedNode(a.node).name
 proc tagName(a: Arr[ClassTag]): string = MixedNode(a.node).name
 proc indexText(x: Rep[int], used: var set[Column]): string
 
 proc markFloat(name: string, used: var set[Column]) =
-  case name
-  of "re": used.incl(colRe)
-  of "im": used.incl(colIm)
-  of "r": used.incl(colR)
-  of "theta": used.incl(colTheta)
-  else: discard
+  if name == "re" or name.endsWith("Re"): used.incl(colRe)
+  elif name == "im" or name.endsWith("Im"): used.incl(colIm)
+  elif name == "r" or name.endsWith("R"): used.incl(colR)
+  elif name == "theta" or name.endsWith("Theta"): used.incl(colTheta)
 
 proc intText(x: Rep[int], used: var set[Column]): string =
   doAssert not x.isStatic
@@ -103,6 +133,19 @@ proc emitFloat(x: Rep[float], used: var set[Column]): string =
     let cart = if n.part == cpRe: emitFloat(c.re, used) else: "(-" & emitFloat(c.im, used) & ")"
     let polar = emitFloat(c.r, used) & (if n.part == cpRe: " * cos(-" & emitFloat(c.theta, used) & ")" else: " * sin(-" & emitFloat(c.theta, used) & ")")
     "(if " & tag & " == ctCartesian: " & cart & " else: " & polar & ")"
+  of mkCartF:
+    let c = n.source
+    let tag = emitTag(c.clzz, used)
+    let cart = if n.part == cpRe: emitFloat(c.re, used) else: emitFloat(c.im, used)
+    let polar = emitFloat(c.r, used) & (if n.part == cpRe: " * cos(" & emitFloat(c.theta, used) & ")" else: " * sin(" & emitFloat(c.theta, used) & ")")
+    "(if " & tag & " == ctCartesian: " & cart & " else: " & polar & ")"
+  of mkAddF:
+    let left = if n.part == cpRe: n.left.re else: n.left.im
+    let right = if n.part == cpRe: n.right.re else: n.right.im
+    "(" & emitFloat(left, used) & " + " & emitFloat(right, used) & ")"
+  of mkScaleF:
+    let value = if n.part == cpRe: n.source.re else: n.source.im
+    "(" & emitFloat(n.scalar, used) & " * " & emitFloat(value, used) & ")"
   else: raise newException(ValueError, "bad float node")
 
 proc emitArray(a: Arr[float]): string =
@@ -119,6 +162,29 @@ proc emitInputs(v: VectorComplex, used: set[Column]): string =
   if colTheta in used: lines.add(emitArray(v.theta))
   if colClzz in used: lines.add(emitTags(v.clzz))
   lines.join("\n")
+
+proc emitInputs*(a, b: VectorComplex, used: set[Column]): string =
+  var lines: seq[string]
+  if colRe in used: lines.add(emitArray(a.re)); lines.add(emitArray(b.re))
+  if colIm in used: lines.add(emitArray(a.im)); lines.add(emitArray(b.im))
+  if colR in used: lines.add(emitArray(a.r)); lines.add(emitArray(b.r))
+  if colTheta in used: lines.add(emitArray(a.theta)); lines.add(emitArray(b.theta))
+  if colClzz in used: lines.add(emitTags(a.clzz)); lines.add(emitTags(b.clzz))
+  lines.join("\n")
+
+proc emitArithmeticProgram*(a, b: VectorComplex, scalar: float,
+    doAdd: bool): string =
+  var used: set[Column]
+  let i = liftNow(0)
+  let z = if doAdd: addAt(a, b, i) else: scalarAt(liftNow(scalar), a, i)
+  let exprRe = emitFloat(z.re, used)
+  let exprIm = emitFloat(z.im, used)
+  let inputs = if doAdd: emitInputs(a, b, used) else: emitInputs(a, used)
+  let lenName = floatName(a.im)
+  result = "import std/math\n\ntype ClassTag = enum ctCartesian, ctPolar\n" &
+    inputs & "\nvar i = 0\nwhile i < len(" & lenName & "):\n  echo " &
+    exprRe.replace("[0]", "[i]") & ", \" \" , " & exprIm.replace("[0]", "[i]") &
+    "\n  i += 1"
 
 proc emitConjComponent(v: VectorComplex, i: Rep[int], used: var set[Column]): string =
   emitFloat(at(v, i).im, used)
