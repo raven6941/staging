@@ -18,6 +18,7 @@ nimcache/
 tests/test_vars
 tests/test_while
 tests/test_fun
+tests/test_eval
 tests/test_effects
 tests/test_scanner
 tests/test_branch_policy
@@ -44,3 +45,4 @@ tests/test_fusion_reduce
 tests/test_fusion_horizontal
 tests/test_shonan
 tests/test_query
+tests/test_veccomplex_arith

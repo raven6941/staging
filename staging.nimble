@@ -51,5 +51,6 @@ task test, "Run the self-tests":
   exec "nim c -r --hints:off --path:src tests/test_hoas.nim"
   exec "nim c -r --hints:off --path:src tests/test_anf.nim"
   exec "nim c -r --hints:off --path:src tests/test_fun.nim"
+  exec "nim c -r -d:nimCallDepthLimit=10000 --hints:off --path:src tests/test_eval.nim"
   exec "nim c -r --hints:off --path:src tests/test_effects.nim"
   exec "nim c -r --hints:off --path:src tests/test_scanner.nim"
