@@ -188,6 +188,40 @@ proc smartIf*[T](cond: Rep[bool],
     let elseResult = elseB()
     dynamic[T](mkNode(cond, thenResult, elseResult))
 
+type
+  ConditionContext* = ref object
+    ## Residual condition identities known on the current staging path.
+    ## IRNode references are deliberately compared by identity.
+    knownTrue: seq[IRNode]
+    knownFalse: seq[IRNode]
+
+proc newConditionContext*(): ConditionContext =
+  ConditionContext(knownTrue: @[], knownFalse: @[])
+
+proc pushKnown[T](facts: var seq[IRNode], node: IRNode,
+                  branch: proc(): Rep[T]): Rep[T] =
+  facts.add(node)
+  try:
+    branch()
+  finally:
+    discard facts.pop()
+
+proc trackedIf*[T](ctx: ConditionContext, cond: Rep[bool],
+                   thenB, elseB: proc(): Rep[T],
+                   mkNode: proc(c: Rep[bool], t, e: Rep[T]): IRNode): Rep[T] =
+  ## smartIf with path-local knowledge of previously staged conditions.
+  ## Static conditions retain smartIf's short-circuiting behavior.
+  if cond.isStatic:
+    return smartIf[T](cond, thenB, elseB, mkNode)
+  if cond.node in ctx.knownTrue:
+    return thenB()
+  if cond.node in ctx.knownFalse:
+    return elseB()
+  smartIf[T](cond,
+    proc(): Rep[T] = pushKnown(ctx.knownTrue, cond.node, thenB),
+    proc(): Rep[T] = pushKnown(ctx.knownFalse, cond.node, elseB),
+    mkNode)
+
 proc unit*(): Rep[Unit] =
   ## The pure statement/value used for an empty residual statement.
   liftNow(Unit())
