@@ -25,6 +25,7 @@ tests/test_structs
 tests/test_complex
 tests/test_union
 tests/test_soa
+tests/test_soa_mixed
 tests/test_hoas
 tests/test_anf
 tests/test_modes
