@@ -24,6 +24,7 @@ tests/test_arrays
 tests/test_stencil
 tests/test_structs
 tests/test_complex
+tests/test_fft
 tests/test_union
 tests/test_soa
 tests/test_soa_mixed
