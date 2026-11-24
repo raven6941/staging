@@ -2,7 +2,7 @@
 
 import staging/framework
 import staging/arrays
-import std/[os, osproc, strutils, times, sequtils]
+import std/[algorithm, os, osproc, strutils, times, sequtils]
 
 type
   RefKind = enum rkField, rkValue
@@ -145,8 +145,7 @@ proc execOp[I, B, S, C, A](s: QuerySym[I, B, S, C, A], o: Operator[A],
         yld(selected, o.outputSchema)))
   of okJoin, okHashJoin:
     let keys = shared(resultSchema(o.parent), resultSchema(o.right))
-    var leftRows: seq[seq[I]] = @[]
-    if o.kind == okJoin:
+    if o.kind == okJoin or keys.len == 0:
       execOp(s, o.parent, tables, proc(f: seq[I], sc: seq[string]): S =
         execOp(s, o.right, tables, proc(g: seq[I], tc: seq[string]): S =
           var c: B
@@ -156,31 +155,57 @@ proc execOp[I, B, S, C, A](s: QuerySym[I, B, S, C, A], o: Operator[A],
             for k in keys[1 .. ^1]: c = s.andB(c, s.eq(f[lookup(sc, k)], g[lookup(tc, k)]))
           s.ifB(c, proc(): S = yld(f & g, sc & tc), proc(): S = s.unit())))
     else:
-      # Residual open-addressed table: key columns, row columns, and counts are
-      # all emitted arrays/vars; only the schema-derived column positions are static.
+      # Residual open-addressed hash table (HashMapBuffer): one slot per
+      # left row, key columns + full row stored in residual arrays; only
+      # the schema-derived column positions are static. Duplicate keys
+      # occupy consecutive slots via linear probing, so the probe phase
+      # scans all matching slots.
       let hsize = 256
-      let htable = s.arrNew(s.lit(hsize), @[])
+      let leftWidth = resultSchema(o.parent).len
+      let htable = s.arrNew(s.lit(hsize), @[]) # -1 empty, 1 occupied
       let hkeys = s.arrNew(s.lit(hsize * keys.len), @[])
-      let hrows = s.arrNew(s.lit(hsize * 256 * resultSchema(o.parent).len), @[])
-      let hcounts = s.arrNew(s.lit(hsize), @[])
-      let used = s.varNew(s.lit(0))
+      let hrows = s.arrNew(s.lit(hsize * leftWidth), @[])
+      let slot = s.varNew(s.lit(0))
       var init = s.unit()
       for i in 0 ..< hsize:
         init = s.seq(init, s.arrWrite(htable, s.lit(i), s.lit(-1)))
-        init = s.seq(init, s.arrWrite(hcounts, s.lit(i), s.lit(0)))
-      let probe = s.varNew(s.lit(0))
-      let residualProbe = s.whileLoop(proc(): B = s.lt(s.varRead(probe), s.lit(0)),
-        proc(): S = s.varWrite(probe, s.add(s.varRead(probe), s.lit(1))))
-      let nested = execOp(s, o.parent, tables, proc(f: seq[I], sc: seq[string]): S =
-        execOp(s, o.right, tables, proc(g: seq[I], tc: seq[string]): S =
-          var c: B
-          if keys.len == 0: c = s.eq(s.lit(0), s.lit(0))
-          else:
-            c = s.eq(f[lookup(sc, keys[0])], g[lookup(tc, keys[0])])
-            for k in keys[1 .. ^1]: c = s.andB(c, s.eq(f[lookup(sc, k)], g[lookup(tc, k)]))
-          s.ifB(c, proc(): S = yld(f & g, sc & tc), proc(): S = s.unit())))
-      discard hkeys; discard hrows; discard hcounts; discard used
-      s.seq(init, s.seq(residualProbe, nested))
+      proc hashOf(row: seq[I], sc: seq[string]): I =
+        var h = s.modulo(row[lookup(sc, keys[0])], s.lit(hsize))
+        for j in 1 ..< keys.len:
+          h = s.modulo(s.add(h, row[lookup(sc, keys[j])]), s.lit(hsize))
+        h
+      proc advanceSlot(): S =
+        s.varWrite(slot, s.modulo(s.add(s.varRead(slot), s.lit(1)), s.lit(hsize)))
+      let build = execOp(s, o.parent, tables, proc(f: seq[I], sc: seq[string]): S =
+        var insert = s.seq(s.varWrite(slot, hashOf(f, sc)),
+          s.whileLoop(proc(): B = s.eq(s.arrRead(htable, s.varRead(slot)), s.lit(1)),
+            proc(): S = advanceSlot()))
+        insert = s.seq(insert, s.arrWrite(htable, s.varRead(slot), s.lit(1)))
+        for j, name in keys:
+          insert = s.seq(insert, s.arrWrite(hkeys,
+            s.add(s.mul(s.varRead(slot), s.lit(keys.len)), s.lit(j)), f[lookup(sc, name)]))
+        for j in 0 ..< leftWidth:
+          insert = s.seq(insert, s.arrWrite(hrows,
+            s.add(s.mul(s.varRead(slot), s.lit(leftWidth)), s.lit(j)), f[j]))
+        insert)
+      let probePhase = execOp(s, o.right, tables, proc(g: seq[I], tc: seq[string]): S =
+        var probeBody = s.varWrite(slot, hashOf(g, tc))
+        let scanSlots = s.whileLoop(proc(): B = s.eq(s.arrRead(htable, s.varRead(slot)), s.lit(1)),
+          proc(): S =
+            var same = s.eq(s.arrRead(hkeys, s.mul(s.varRead(slot), s.lit(keys.len))),
+              g[lookup(tc, keys[0])])
+            for j in 1 ..< keys.len:
+              same = s.andB(same, s.eq(s.arrRead(hkeys,
+                s.add(s.mul(s.varRead(slot), s.lit(keys.len)), s.lit(j))),
+                g[lookup(tc, keys[j])]))
+            var leftRow: seq[I] = @[]
+            for j in 0 ..< leftWidth:
+              leftRow.add(s.arrRead(hrows,
+                s.add(s.mul(s.varRead(slot), s.lit(leftWidth)), s.lit(j))))
+            s.seq(s.ifB(same, proc(): S = yld(leftRow & g, resultSchema(o.parent) & tc),
+              proc(): S = s.unit()), advanceSlot()))
+        s.seq(probeBody, scanSlots))
+      s.seq(init, s.seq(build, probePhase))
   of okGroup:
     let cap = 256
     let used = s.varNew(s.lit(0))
@@ -300,7 +325,7 @@ proc flatten(rows: seq[seq[int]]): seq[int] =
   for row in rows:
     for x in row: result.add(x)
 
-proc stagedOperator(q: Operator[seq[seq[int]]], table, rightTable: Table[Arr[int]] = Table[Arr[int]]()): Operator[Arr[int]] =
+proc stagedOperator(q: Operator[seq[seq[int]]], table: Table[Arr[int]]; rightTable: Table[Arr[int]] = Table[Arr[int]]()): Operator[Arr[int]] =
   case q.kind
   of okScan: scan(if q.source == 0: table.data else: rightTable.data,
       if q.source == 0: table.schema else: rightTable.schema, q.source)
@@ -474,7 +499,13 @@ when isMainModule:
     let plan = runPlan(stagedSym(), stagedOperator(q, lt, rt), lt, rt)
     let residual = emitStmt(plan.body)
     let got = runStaged(plan)
-    doAssert got == flatten(expected), "join got=" & $got & " expected=" & $flatten(expected) & " residual=" & residual
+    # HashJoin emits probe-major order (right row outer), the nested-loop
+    # join emits left-major order; both are the same multiset of rows.
+    let width = resultSchema(q).len
+    proc asRows(flat: seq[int]): seq[seq[int]] =
+      for i in countup(0, flat.len - 1, width): result.add(flat[i ..< i + width])
+    doAssert sorted(asRows(got).mapIt($it)) == sorted(asRows(flatten(expected)).mapIt($it)),
+      "join got=" & $got & " expected=" & $flatten(expected) & " residual=" & residual
     doAssert residual.count("while") >= 2
     for name in leftSchema & rightSchema: doAssert name notin residual
     if q.kind == okHashJoin:
