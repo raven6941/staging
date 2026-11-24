@@ -21,6 +21,7 @@ tests/test_branch_policy
 tests/test_rep_static
 tests/test_arrays
 tests/test_structs
+tests/test_complex
 tests/test_hoas
 tests/test_anf
 tests/test_modes
