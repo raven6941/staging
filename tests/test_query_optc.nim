@@ -245,7 +245,11 @@ proc directRows(q: Operator): seq[seq[string]] =
     if q.aggKind in {akSum, akAvg}:
       for n in q.aggregates:
         doAssert not kinds[lookup(ps, n)], "aggregate field must be integer"
-    var groups = initTable[string, seq[string]]()
+    # Insertion-ordered: plain Table iteration order is Nim-version
+    # dependent (2.0.8 yields Bob before Ada here), while the staged
+    # path emits groups in first-seen order. OrderedTable keeps the
+    # oracle deterministic and in agreement with staged on all versions.
+    var groups = initOrderedTable[string, seq[string]]()
     for row in directRows(q.parent):
       let k = q.keys.mapIt(row[lookup(ps, it)]).join("\x1f")
       if not groups.hasKey(k): groups[k] = q.keys.mapIt(row[lookup(ps, it)]) & @[$1] & q.aggregates.mapIt(row[lookup(ps, it)])
