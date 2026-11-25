@@ -3,7 +3,7 @@ import test_query_optc
 
 type
   TokenKind = enum tkEof, tkWord, tkInt, tkString, tkBad, tkStar, tkComma, tkLParen,
-    tkRParen, tkEquals, tkDelim
+    tkRParen, tkEquals, tkLess, tkDelim
   Token = object
     kind: TokenKind
     text: string
@@ -41,6 +41,7 @@ proc tokenize(s: string): seq[Token] =
     of '(' : addToken(result, tkLParen, "(", i); inc i
     of ')' : addToken(result, tkRParen, ")", i); inc i
     of '=' : addToken(result, tkEquals, "=", i); inc i
+    of '<' : addToken(result, tkLess, "<", i); inc i
     of '*': addToken(result, tkStar, "*", i); inc i
     of '\'':
       inc i
@@ -58,7 +59,7 @@ proc tokenize(s: string): seq[Token] =
         while i < s.len and s[i].isDigit: inc i
         addToken(result, tkInt, s[at ..< i], at)
       else:
-        while i < s.len and s[i] notin {' ', '\t', '\n', '\r', ',', '(', ')', '=', '*', '\'', '\\'}: inc i
+        while i < s.len and s[i] notin {' ', '\t', '\n', '\r', ',', '(', ')', '=', '<', '*', '\'', '\\'}: inc i
         addToken(result, tkWord, s[at ..< i], at)
   result.add(Token(kind: tkEof, offset: s.len))
 
@@ -116,6 +117,23 @@ proc refValue(p: var Parser): Ref =
   of tkWord: field(p.take.text)
   else: raise p.parseError(p.current, "field, string, or integer")
 
+proc comparison(p: var Parser): Predicate =
+  let a = p.refValue
+  if p.current.kind == tkEquals:
+    discard p.take; result = equals(a, p.refValue)
+  elif p.current.kind == tkLess:
+    discard p.take; result = lessThan(a, p.refValue)
+  else: raise p.parseError(p.current, "= or <")
+
+proc andExpression(p: var Parser): Predicate =
+  result = p.comparison
+  while p.acceptWord("and"): result = predAnd(result, p.comparison)
+
+proc predicateExpression(p: var Parser): Predicate =
+  ## AND binds tighter than OR, matching conventional boolean expression precedence.
+  result = p.andExpression
+  while p.acceptWord("or"): result = predOr(result, p.andExpression)
+
 proc statement(p: var Parser): Operator =
   discard p.want(tkWord, "select")
   var outNames, inNames: seq[string]
@@ -125,8 +143,7 @@ proc statement(p: var Parser): Operator =
   discard p.want(tkWord, "from")
   result = p.joinClause
   if p.acceptWord("where"):
-    let a = p.refValue; discard p.want(tkEquals, "="); let b = p.refValue
-    result = filter(equals(a, b), result)
+    result = filter(p.predicateExpression, result)
   if p.acceptWord("group"):
     discard p.want(tkWord, "by")
     let keys = p.fieldNames
@@ -157,6 +174,26 @@ when isMainModule:
   expectShape("select * from t.csv join (select Name from t.csv)", "HashJoin(Scan(Name,Flag,Value);Project(Name;Name;Scan(Name,Flag,Value)))", resolve)
   expectShape("select * from t.csv group by Name sum Value", "Group(Name;Value;Scan(Name,Flag,Value))", resolve)
   doAssert runStaged(parseSql("select * from t.csv where Flag='yes'", resolve)) == @["Ada,yes,10", "Ada,yes,7"]
+  # Load-bearing: the following assertion fails if the residual Lt branch is
+  # stubbed out (verified by stubbing it once, observing the failure, restoring).
+  doAssert runStaged(parseSql("select * from t.csv where Value<10", resolve)) == @["Ada,yes,7"]
+  # String Lt is lexicographic: 'Ada' < 'Bob', so only the Ada rows match.
+  doAssert runStaged(parseSql("select * from t.csv where Name<'Bob'", resolve)) == @["Ada,yes,10", "Ada,yes,7"]
+  doAssert directRows(parseSql("select * from t.csv where Name<'Bob'", resolve)) == @[@["Ada", "yes", "10"], @["Ada", "yes", "7"]]
+  doAssert runStaged(parseSql("select Name as Name1 from t.csv where Name='Ada' and Value=7", resolve)) == @["Ada"]
+  doAssert runStaged(parseSql("select * from t.csv where Name='Ada' or Flag='no'", resolve)) == @["Ada,yes,10", "Bob,no,20", "Ada,yes,7"]
+  # AND binds tighter than OR: this selects both Ada rows and Bob's row.
+  let mixed = parseSql("select * from t.csv where Name='Ada' or Flag='no' and Value=20", resolve)
+  doAssert runStaged(mixed) == @["Ada,yes,10", "Bob,no,20", "Ada,yes,7"]
+  doAssert directRows(mixed) == @[@["Ada", "yes", "10"], @["Bob", "no", "20"], @["Ada", "yes", "7"]]
+  try:
+    discard directRows(parseSql("select * from t.csv where Value='x'", resolve))
+    doAssert false
+  except AssertionDefect: discard
+  try:
+    discard execOp(parseSql("select * from t.csv where Name<5", resolve))
+    doAssert false
+  except AssertionDefect: discard
   doAssert directRows(parseSql("select Name as Name1 from t.csv", resolve)) == @[@["Ada"], @["Bob"], @["Ada"]]
   doAssert directRows(parseSql("select * from nestedloops t.csv join (select Name as Name1 from t.csv)", resolve)).len == 9
   doAssert directRows(parseSql("select * from t.csv join (select Name from t.csv)", resolve)).len == 5
