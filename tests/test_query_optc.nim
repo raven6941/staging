@@ -22,7 +22,7 @@ type
 
   NodeKind = enum nkInput, nkScanner, nkNext, nkNextInt, nkHasNext, nkClose,
     nkVarDecl, nkVarRead, nkVarWrite, nkSeq, nkWhile, nkIf, nkAdd, nkMul,
-    nkEq, nkLt, nkAnd, nkOr, nkNot, nkStringLen, nkStringEq, nkStringLt, nkHash, nkMod, nkArrDecl,
+    nkEq, nkLt, nkAnd, nkOr, nkNot, nkStringLen, nkStringEq, nkStringLt, nkHash, nkMod, nkDiv, nkArrDecl,
     nkArrRead, nkArrWrite, nkBufferLen, nkBufferAppend, nkBufferRead, nkPrint
   QueryNode = ref object of IRNode
     kind: NodeKind
@@ -76,11 +76,13 @@ type
     kind*: PredicateKind
     left*, right*: Ref
     a*, b*: Predicate
+  AggKind* = enum akSum, akAvg, akMin, akMax
   OpKind* = enum okScan, okFilter, okProject, okJoin, okHashJoin, okGroup, okSort, okPrintCSV
   Operator* = ref object
     kind: OpKind
     csv, csvRight: string
     schema, outputSchema, inputSchema, keys, aggregates: seq[string]
+    aggKind: AggKind
     sortKeys: seq[string]
     sortDesc: seq[bool]
     delim: char
@@ -113,7 +115,14 @@ proc project*(s: seq[string]; q: Operator; inputSchema: seq[string] = @[]): Oper
     inputSchema: (if inputSchema.len == 0: s else: inputSchema), parent: q)
 proc join*(a, b: Operator): Operator = Operator(kind: okJoin, parent: a, right: b)
 proc hashJoin*(a, b: Operator): Operator = Operator(kind: okHashJoin, parent: a, right: b)
-proc group*(keys, aggs: seq[string]; q: Operator): Operator = Operator(kind: okGroup, keys: keys, aggregates: aggs, parent: q)
+proc group*(keys, aggs: seq[string]; q: Operator; kind = akSum): Operator =
+  Operator(kind: okGroup, keys: keys, aggregates: aggs, aggKind: kind, parent: q)
+proc aggName*(kind: AggKind): string =
+  case kind
+  of akSum: "sum"
+  of akAvg: "avg"
+  of akMin: "min"
+  of akMax: "max"
 proc printCSV(q: Operator): Operator = Operator(kind: okPrintCSV, parent: q)
 proc equals*(a, b: Ref): Predicate = Predicate(kind: pkEquals, left: a, right: b)
 proc lessThan*(a, b: Ref): Predicate = Predicate(kind: pkLessThan, left: a, right: b)
@@ -137,7 +146,7 @@ proc opShape*(q: Operator): string =
   of okProject: "Project(" & q.outputSchema.join(",") & ";" & q.inputSchema.join(",") & ";" & opShape(q.parent) & ")"
   of okJoin: "Join(" & opShape(q.parent) & ";" & opShape(q.right) & ")"
   of okHashJoin: "HashJoin(" & opShape(q.parent) & ";" & opShape(q.right) & ")"
-  of okGroup: "Group(" & q.keys.join(",") & ";" & q.aggregates.join(",") & ";" & opShape(q.parent) & ")"
+  of okGroup: "Group(" & q.keys.join(",") & ";" & aggName(q.aggKind) & ":" & q.aggregates.join(",") & ";" & opShape(q.parent) & ")"
   of okSort:
     "Sort(" & q.sortKeys.mapIt(it & ":" & (if q.sortDesc[q.sortKeys.find(it)]: "desc" else: "asc")).join(",") & ";" & opShape(q.parent) & ")"
   of okPrintCSV: "Print(" & opShape(q.parent) & ")"
@@ -215,9 +224,23 @@ proc directRows(q: Operator): seq[seq[string]] =
       let k = q.keys.mapIt(row[lookup(ps, it)]).join("\x1f")
       if not groups.hasKey(k): groups[k] = q.keys.mapIt(row[lookup(ps, it)]) & @[$1] & q.aggregates.mapIt(row[lookup(ps, it)])
       else:
-        groups[k][q.keys.len] = $(parseInt(groups[k][q.keys.len]) + 1)
-        for j, n in q.aggregates: groups[k][q.keys.len + 1 + j] = $(parseInt(groups[k][q.keys.len + 1 + j]) + parseInt(row[lookup(ps, n)]))
-    for x in groups.values: result.add(x)
+        let countIndex = q.keys.len
+        groups[k][countIndex] = $(parseInt(groups[k][countIndex]) + 1)
+        for j, n in q.aggregates:
+          let valueIndex = countIndex + 1 + j
+          let value = parseInt(row[lookup(ps, n)])
+          let current = parseInt(groups[k][valueIndex])
+          case q.aggKind
+          of akSum, akAvg: groups[k][valueIndex] = $(current + value)
+          of akMin: groups[k][valueIndex] = $(min(current, value))
+          of akMax: groups[k][valueIndex] = $(max(current, value))
+    for x in groups.mvalues:
+      if q.aggKind == akAvg:
+        let count = parseInt(x[q.keys.len])
+        for j in 0 ..< q.aggregates.len:
+          let i = q.keys.len + 1 + j
+          x[i] = $(parseInt(x[i]) div count)
+      result.add(x)
   of okSort:
     result = directRows(q.parent)
     let schema = resultSchema(q.parent)
@@ -265,6 +288,7 @@ proc fieldHash(a: RString): Rep[int] =
 proc intAdd(a, b: Rep[int]): Rep[int] = smartOp[int](a, b, proc(x,y:int):int=x+y, proc(x,y:Rep[int]):IRNode=QueryNode(kind:nkAdd,left:x,right:y))
 proc intMul(a, b: Rep[int]): Rep[int] = smartOp[int](a, b, proc(x,y:int):int=x*y, proc(x,y:Rep[int]):IRNode=QueryNode(kind:nkMul,left:x,right:y))
 proc intMod(a, b: Rep[int]): Rep[int] = smartOp[int](a, b, proc(x,y:int):int=x mod y, proc(x,y:Rep[int]):IRNode=QueryNode(kind:nkMod,left:x,right:y))
+proc intDiv(a, b: Rep[int]): Rep[int] = smartOp[int](a, b, proc(x,y:int):int=x div y, proc(x,y:Rep[int]):IRNode=QueryNode(kind:nkDiv,left:x,right:y))
 proc seqs(a,b: Rep[Unit]): Rep[Unit] = seqR(a,b,proc(x,y:Rep[Unit]):IRNode=QueryNode(kind:nkSeq,a:x,b:y))
 proc seqMany(xs: openArray[Rep[Unit]]): Rep[Unit] =
   result = unit()
@@ -280,6 +304,7 @@ proc emitInt(x: Rep[int]): string =
   of nkAdd: "(" & emitInt(n.left) & " + " & emitInt(n.right) & ")"
   of nkMul: "(" & emitInt(n.left) & " * " & emitInt(n.right) & ")"
   of nkMod: "(" & emitInt(n.left) & " mod " & emitInt(n.right) & ")"
+  of nkDiv: "(" & emitInt(n.left) & " div " & emitInt(n.right) & ")"
   of nkHash: "hashString(" & emitString(n.sleft) & ")"
   of nkBufferRead: QueryNode(n.arr.node).name & "[" & emitInt(n.index) & "]"
   of nkArrRead: QueryNode(n.arr.node).name & "[" & emitInt(n.index) & "]"
@@ -482,7 +507,7 @@ proc execOpWith(q: Operator; emitRow: proc(f: seq[RField]): Rep[Unit];
       else:
         keyBufS.add(nil); keyBufI.add(ia(if j == 0: "groupKeyInts" else: "groupKeyI" & $j))
         outKeyS.add(nil); outKeyI.add(ia(if j == 0: "outKeyInts" else: "outKeyI" & $j))
-    let outCount=ia("outCounts"); let outSum=ia("outSums")
+    let outCount=ia("outCounts"); let outAgg=ia("outAggs")
     var inputColsS: seq[Arr[string]] = @[]
     var inputColsI: seq[Arr[int]] = @[]
     for i in 0 ..< schema.len:
@@ -502,6 +527,7 @@ proc execOpWith(q: Operator; emitRow: proc(f: seq[RField]): Rep[Unit];
           inputWrites.add(aw(inputColsI[iCol],vr(inputPos),f[i].int.value)); inc iCol
       for j,n in q.aggregates:
         let aggregateIndex = lookup(schema,n)
+        doAssert not stringKinds[aggregateIndex], "aggregate field must be integer"
         var aggregateStorageIndex = 0
         for i in 0 ..< aggregateIndex:
           if not stringKinds[i]: inc aggregateStorageIndex
@@ -544,14 +570,21 @@ proc execOpWith(q: Operator; emitRow: proc(f: seq[RField]): Rep[Unit];
       let update = ifB(eqI(vr(found),staticInt(1)),
         proc():Rep[Unit]=
           let compact = ar(slotIndex,vr(pos)); var xs: seq[Rep[Unit]] = @[aw(outCount,compact,intAdd(ar(outCount,compact),staticInt(1)))]
-          for j,n in q.aggregates: xs.add(aw(outSum,intAdd(intMul(compact,staticInt(q.aggregates.len)),staticInt(j)),intAdd(ar(outSum,intAdd(intMul(compact,staticInt(q.aggregates.len)),staticInt(j))),ar(inputAgg[j],vr(inputPos)))))
+          for j,n in q.aggregates:
+            let aggregateIndex = intAdd(intMul(compact,staticInt(q.aggregates.len)),staticInt(j))
+            let current = ar(outAgg, aggregateIndex)
+            let incoming = ar(inputAgg[j],vr(inputPos))
+            case q.aggKind
+            of akSum, akAvg: xs.add(aw(outAgg,aggregateIndex,intAdd(current,incoming)))
+            of akMin: xs.add(ifB(ltI(incoming,current), proc():Rep[Unit]=aw(outAgg,aggregateIndex,incoming), proc():Rep[Unit]=unit()))
+            of akMax: xs.add(ifB(ltI(current,incoming), proc():Rep[Unit]=aw(outAgg,aggregateIndex,incoming), proc():Rep[Unit]=unit()))
           addMany(xs),
         proc():Rep[Unit]=
           var xs: seq[Rep[Unit]] = @[aw(slotIndex,vr(pos),vr(used)), aw(outCount,vr(used),staticInt(1))]
           for j, key in storedKeys:
             if key.kind == fkString: xs.add(sw(outKeyS[j],vr(used),key.str.data))
             else: xs.add(aw(outKeyI[j],vr(used),key.int.value))
-          for j,n in q.aggregates: xs.add(aw(outSum,intAdd(intMul(vr(used),staticInt(q.aggregates.len)),staticInt(j)),ar(inputAgg[j],vr(inputPos))))
+          for j,n in q.aggregates: xs.add(aw(outAgg,intAdd(intMul(vr(used),staticInt(q.aggregates.len)),staticInt(j)),ar(inputAgg[j],vr(inputPos))))
           xs.add(vw(used,intAdd(vr(used),staticInt(1)))); addMany(xs))
       updates.add(update); updates.add(vw(inputPos,intAdd(vr(inputPos),staticInt(1)))); addMany(updates)
     let consumeAll = scanRows(q.parent.csv, schema, stringKinds, q.parent.delim, consume)
@@ -564,7 +597,10 @@ proc execOpWith(q: Operator; emitRow: proc(f: seq[RField]): Rep[Unit];
         else:
           fs.add(RField(kind:fkInt,int:RInt(value:ar(outKeyI[j],vr(outPos)))))
       fs.add(RField(kind:fkInt,int:RInt(value:ar(outCount,vr(outPos)))))
-      for j in 0 ..< q.aggregates.len: fs.add(RField(kind:fkInt,int:RInt(value:ar(outSum,intAdd(intMul(vr(outPos),staticInt(q.aggregates.len)),staticInt(j))))))
+      for j in 0 ..< q.aggregates.len:
+        let aggregate = ar(outAgg,intAdd(intMul(vr(outPos),staticInt(q.aggregates.len)),staticInt(j)))
+        let value = if q.aggKind == akAvg: intDiv(aggregate, ar(outCount,vr(outPos))) else: aggregate
+        fs.add(RField(kind:fkInt,int:RInt(value:value)))
       seqs(emitRow(fs),vw(outPos,intAdd(vr(outPos),staticInt(1)))))
     body = seqs(consumeAll,outLoop)
   elif q.kind == okHashJoin:
@@ -751,6 +787,11 @@ when isMainModule:
   let mixedKeyCsv = "dept,name,amount\n10,Ada,2\n10,Bob,3\n10,Ada,5\n"
   let mixedKeyGroup = group(@["dept", "name"], @["amount"], scan(mixedKeyCsv,@["dept","name","amount"]))
   doAssert sorted(runStaged(mixedKeyGroup)) == sorted(directRows(mixedKeyGroup).mapIt(it.join(",")))
+
+  let reverseMaxCsv = "name,amount\nAda,7\nAda,10\n"
+  let reverseMaxGroup = group(@["name"], @["amount"], scan(reverseMaxCsv,@["name","amount"]), akMax)
+  doAssert runStaged(reverseMaxGroup) == directRows(reverseMaxGroup).mapIt(it.join(","))
+  doAssert runStaged(reverseMaxGroup) == @["Ada,2,10"]
 
   let nonKeyStringCsv = "name,dept,amount\nAda,10,2\nBob,20,3\nAda,30,5\n"
   let nonKeyStringGroup = group(@["name"], @["amount"], scan(nonKeyStringCsv,@["name","dept","amount"]))
