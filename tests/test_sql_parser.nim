@@ -187,14 +187,18 @@ proc expectShape(sql, expected: string; resolveTable: proc(ident: string): Opera
 when isMainModule:
   let csv = "Name,Flag,Value\nAda,yes,10\nBob,no,20\nAda,yes,7\n"
   let stringAggCsv = "Name,Flag,Value\nAda,x,10\nAda,10,11\nAda,9,12\nBob,8,13\n"
+  let numericFirstStringAggCsv = "Name,Flag,Value\nAda,10,11\nAda,9,12\nAda,x,15\nBob,8,13\nBob,7,14\n"
   let stringOrderCsv = "Name,Flag,Value\nAda,x,10\nAda,y,11\nBob,z,12\n"
+  let emptyCsv = "Name,Flag,Value\n"
   let multiCsv = "Dept,Name,Value\n10,Ada,2\n10,Bob,3\n10,Ada,5\n"
   let gram = "Phrase\tYear\tMatchCount\tVolumeCount\nAuswanderung\t2000\t3\t4\nOther\t2001\t2\t3\n"
   proc resolve(n: string): Operator =
     if n == "?": scan(gram, @["Phrase", "Year", "MatchCount", "VolumeCount"], '\t')
     elif n == "multi.csv": scan(multiCsv, @["Dept", "Name", "Value"])
     elif n == "strings.csv": scan(stringAggCsv, @["Name", "Flag", "Value"])
+    elif n == "numeric-first-strings.csv": scan(numericFirstStringAggCsv, @["Name", "Flag", "Value"])
     elif n == "string-order.csv": scan(stringOrderCsv, @["Name", "Flag", "Value"])
+    elif n == "empty.csv": scan(emptyCsv, @["Name", "Flag", "Value"])
     else: scan(csv, @["Name", "Flag", "Value"])
   expectShape("select * from t.csv", "Scan(Name,Flag,Value)", resolve)
   expectShape("select Name from t.csv", "Project(Name;Name;Scan(Name,Flag,Value))", resolve)
@@ -256,6 +260,31 @@ when isMainModule:
     discard runStaged(parseSql("select * from t.csv group by Name avg Flag", resolve))
     doAssert false
   except AssertionDefect: discard
+  # Regression: the filtered first surviving row must not change the source
+  # column kind used by either execution path.
+  let numericFirstMin = parseSql("select * from numeric-first-strings.csv group by Name min Flag", resolve)
+  doAssert runStaged(numericFirstMin) == @[
+    "Ada,3,10", "Bob,2,7"]
+  doAssert runStaged(numericFirstMin) == directRows(numericFirstMin).mapIt(it.join(","))
+  let numericFirstMax = parseSql("select * from numeric-first-strings.csv group by Name max Flag", resolve)
+  doAssert runStaged(numericFirstMax) == @[
+    "Ada,3,x", "Bob,2,8"]
+  doAssert runStaged(numericFirstMax) == directRows(numericFirstMax).mapIt(it.join(","))
+  let orderedNumericFirstMin = parseSql("select * from numeric-first-strings.csv group by Name min Flag order by Flag", resolve)
+  doAssert runStaged(orderedNumericFirstMin) == directRows(orderedNumericFirstMin).mapIt(it.join(","))
+  var stagedFilterRaised = false
+  try:
+    discard runStaged(parseSql("select * from strings.csv where Flag='10' group by Name sum Flag", resolve))
+  except AssertionDefect: stagedFilterRaised = true
+  doAssert stagedFilterRaised
+  var oracleFilterRaised = false
+  try:
+    discard directRows(parseSql("select * from strings.csv where Flag='10' group by Name sum Flag", resolve))
+  except AssertionDefect: oracleFilterRaised = true
+  doAssert oracleFilterRaised
+  let emptyQuery = parseSql("select * from empty.csv", resolve)
+  doAssert runStaged(emptyQuery) == @[]
+  doAssert runStaged(emptyQuery) == directRows(emptyQuery).mapIt(it.join(","))
   for kind in [akMin, akMax]:
     let grouped = parseSql("select * from strings.csv group by Name " & aggName(kind) & " Flag", resolve)
     doAssert sorted(runStaged(grouped)) == sorted(directRows(grouped).mapIt(it.join(",")))
