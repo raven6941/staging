@@ -291,24 +291,63 @@ proc execOp(q: Operator): string =
       if x in b: result.add(x)
   var body: Rep[Unit]
   if q.kind == okGroup:
-    let schema = resultSchema(q.parent); let kinds = schema.mapIt(it in q.keys)
+    let schema = resultSchema(q.parent)
+    let stringKinds = stringCols(q.parent.csv, schema)
+    let keyIndex = lookup(schema, q.keys[0])
+    let keyKind = if stringKinds[keyIndex]: fkString else: fkInt
     let used=iv("used"); let pos=iv("slot"); let found=iv("found"); let outPos=iv("outPos")
-    let occupied=ia("occupied"); let slotIndex=ia("slotIndex"); let keyBuf=sa("groupKeys"); let countBuf=ia("groupCounts")
-    let sumBuf=ia("groupSums"); let outKey=sa("outKeys"); let outCount=ia("outCounts"); let outSum=ia("outSums"); let inputKey=sa("inputKey")
+    let occupied=ia("occupied"); let slotIndex=ia("slotIndex")
+    let keyBufS=sa("groupKeys"); let keyBufI=ia("groupKeyInts")
+    let outKeyS=sa("outKeys"); let outKeyI=ia("outKeyInts")
+    let outCount=ia("outCounts"); let outSum=ia("outSums")
+    var inputColsS: seq[Arr[string]] = @[]
+    var inputColsI: seq[Arr[int]] = @[]
+    for i in 0 ..< schema.len:
+      if stringKinds[i]: inputColsS.add(sa("inputColS" & $i))
+      else: inputColsI.add(ia("inputColI" & $i))
+    var keyStorageIndex = 0
+    for i in 0 ..< keyIndex:
+      if stringKinds[i] == (keyKind == fkString): inc keyStorageIndex
     var inputAgg: seq[Arr[int]] = @[]
     for k in 0 ..< q.aggregates.len: inputAgg.add(ia("inputAgg" & $k))
     let inputPos=iv("inputPos")
     proc consume(f: seq[RField]): Rep[Unit] =
-      let keyField = RString(data:sr(inputKey,vr(inputPos)))
-      var h: Rep[int] = fieldHash(keyField)
-      h = intMod(h, staticInt(cap))
-      var inputWrites: seq[Rep[Unit]] = @[sw(inputKey,vr(inputPos),f[lookup(schema,q.keys[0])].str.data)]
-      for j,n in q.aggregates: inputWrites.add(aw(inputAgg[j],vr(inputPos),f[lookup(schema,n)].int.value))
+      var inputWrites: seq[Rep[Unit]] = @[]
+      var sCol = 0
+      var iCol = 0
+      for i in 0 ..< schema.len:
+        if stringKinds[i]:
+          inputWrites.add(sw(inputColsS[sCol],vr(inputPos),f[i].str.data)); inc sCol
+        else:
+          inputWrites.add(aw(inputColsI[iCol],vr(inputPos),f[i].int.value)); inc iCol
+      for j,n in q.aggregates:
+        let aggregateIndex = lookup(schema,n)
+        var aggregateStorageIndex = 0
+        for i in 0 ..< aggregateIndex:
+          if not stringKinds[i]: inc aggregateStorageIndex
+        inputWrites.add(aw(inputAgg[j],vr(inputPos),ar(inputColsI[aggregateStorageIndex],vr(inputPos))))
+      var h: Rep[int]
+      var stringKey: Rep[string]
+      var intKey: Rep[int]
+      if keyKind == fkString:
+        stringKey = sr(inputColsS[keyStorageIndex],vr(inputPos))
+        h = intMod(fieldHash(RString(data: stringKey)), staticInt(cap))
+      else:
+        intKey = ar(inputColsI[keyStorageIndex],vr(inputPos))
+        h = intMod(intKey, staticInt(cap))
       let stable = addMany(inputWrites)
       let seek = whileLoop(proc():Rep[bool]=andB(ltI(vr(pos),staticInt(cap)),eqI(vr(found),staticInt(0))), proc():Rep[Unit]=
         ifB(eqI(ar(occupied,vr(pos)),staticInt(1)),
-          proc():Rep[Unit]=ifB(stringCompare(keyField,RString(data:sr(keyBuf,vr(pos)))),proc():Rep[Unit]=vw(found,staticInt(1)),proc():Rep[Unit]=vw(pos,intAdd(vr(pos),staticInt(1)))),
-          proc():Rep[Unit]=seqs(sw(keyBuf,vr(pos),keyField.data),seqs(aw(occupied,vr(pos),staticInt(1)),vw(found,staticInt(2))))))
+          proc():Rep[Unit]=
+            if keyKind == fkString:
+              ifB(stringCompare(RString(data: stringKey),RString(data:sr(keyBufS,vr(pos)))),proc():Rep[Unit]=vw(found,staticInt(1)),proc():Rep[Unit]=vw(pos,intAdd(vr(pos),staticInt(1))))
+            else:
+              ifB(eqI(intKey,ar(keyBufI,vr(pos))),proc():Rep[Unit]=vw(found,staticInt(1)),proc():Rep[Unit]=vw(pos,intAdd(vr(pos),staticInt(1)))),
+          proc():Rep[Unit]=
+            if keyKind == fkString:
+              seqs(sw(keyBufS,vr(pos),stringKey),seqs(aw(occupied,vr(pos),staticInt(1)),vw(found,staticInt(2))))
+            else:
+              seqs(aw(keyBufI,vr(pos),intKey),seqs(aw(occupied,vr(pos),staticInt(1)),vw(found,staticInt(2))))))
       var updates: seq[Rep[Unit]] = @[stable, vw(pos,h), vw(found,staticInt(0)), seek]
       let update = ifB(eqI(vr(found),staticInt(1)),
         proc():Rep[Unit]=
@@ -316,15 +355,20 @@ proc execOp(q: Operator): string =
           for j,n in q.aggregates: xs.add(aw(outSum,intAdd(intMul(compact,staticInt(q.aggregates.len)),staticInt(j)),intAdd(ar(outSum,intAdd(intMul(compact,staticInt(q.aggregates.len)),staticInt(j))),ar(inputAgg[j],vr(inputPos)))))
           addMany(xs),
         proc():Rep[Unit]=
-          var xs: seq[Rep[Unit]] = @[aw(slotIndex,vr(pos),vr(used)), sw(outKey,vr(used),keyField.data), aw(outCount,vr(used),staticInt(1))]
+          var xs: seq[Rep[Unit]] = @[aw(slotIndex,vr(pos),vr(used)), aw(outCount,vr(used),staticInt(1))]
+          if keyKind == fkString: xs.add(sw(outKeyS,vr(used),stringKey))
+          else: xs.add(aw(outKeyI,vr(used),intKey))
           for j,n in q.aggregates: xs.add(aw(outSum,intAdd(intMul(vr(used),staticInt(q.aggregates.len)),staticInt(j)),ar(inputAgg[j],vr(inputPos))))
           xs.add(vw(used,intAdd(vr(used),staticInt(1)))); addMany(xs))
       updates.add(update); updates.add(vw(inputPos,intAdd(vr(inputPos),staticInt(1)))); addMany(updates)
-    let consumeAll = scanRows(q.parent.csv, schema, kinds, consume)
+    let consumeAll = scanRows(q.parent.csv, schema, stringKinds, consume)
     var output: seq[Rep[Unit]] = @[]
     let outLoop = whileLoop(proc():Rep[bool]=ltI(vr(outPos),vr(used)), proc():Rep[Unit]=
       var fs: seq[RField] = @[]
-      for j in 0 ..< q.keys.len: fs.add(RField(kind:fkString,str:RString(data:sr(outKey,intAdd(intMul(vr(outPos),staticInt(q.keys.len)),staticInt(j))))))
+      if keyKind == fkString:
+        fs.add(RField(kind:fkString,str:RString(data:sr(outKeyS,vr(outPos)))))
+      else:
+        fs.add(RField(kind:fkInt,int:RInt(value:ar(outKeyI,vr(outPos)))))
       fs.add(RField(kind:fkInt,int:RInt(value:ar(outCount,vr(outPos)))))
       for j in 0 ..< q.aggregates.len: fs.add(RField(kind:fkInt,int:RInt(value:ar(outSum,intAdd(intMul(vr(outPos),staticInt(q.aggregates.len)),staticInt(j))))))
       seqs(pr(fs),vw(outPos,intAdd(vr(outPos),staticInt(1)))))
@@ -421,6 +465,16 @@ when isMainModule:
   doAssert "result = result * 41 + ord(a[i])" in residual
   let stagedGroup = runStaged(q)
   doAssert sorted(stagedGroup) == sorted(expected), $stagedGroup & " != " & $expected
+
+  let intKeyCsv = "dept,amount\n10,2\n20,3\n10,5\n"
+  let intKeyGroup = group(@["dept"], @["amount"], scan(intKeyCsv,@["dept","amount"]))
+  let intKeyResidual = execOp(intKeyGroup)
+  doAssert "groupKeyInts" in intKeyResidual and "outKeyInts" in intKeyResidual
+  doAssert sorted(runStaged(intKeyGroup)) == sorted(directRows(intKeyGroup).mapIt(it.join(",")))
+
+  let nonKeyStringCsv = "name,dept,amount\nAda,10,2\nBob,20,3\nAda,30,5\n"
+  let nonKeyStringGroup = group(@["name"], @["amount"], scan(nonKeyStringCsv,@["name","dept","amount"]))
+  doAssert sorted(runStaged(nonKeyStringGroup)) == sorted(directRows(nonKeyStringGroup).mapIt(it.join(",")))
 
   let l = "id,value\nA,2\nB,3\n"
   let r = "id,rvalue\nA,10\nB,20\n"
