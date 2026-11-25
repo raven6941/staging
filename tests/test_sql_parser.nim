@@ -265,7 +265,7 @@ when isMainModule:
       of akMax: @["Ada,2,10", "Bob,1,20"]
       else: @[]
     doAssert staged == sorted(expected)
-  let orderedAverage = parseSql("select * from t.csv group by Name avg Value order by Value", resolve)
+  let orderedAverage = parseSql("select * from t.csv group by Name avg Value order by avg_Value", resolve)
   doAssert runStaged(orderedAverage) == directRows(orderedAverage).mapIt(it.join(","))
   doAssert runStaged(orderedAverage) == @["Ada,2,8", "Bob,1,20"]
   try:
@@ -286,7 +286,7 @@ when isMainModule:
   doAssert runStaged(numericFirstMax) == @[
     "Ada,3,x", "Bob,2,8"]
   doAssert runStaged(numericFirstMax) == directRows(numericFirstMax).mapIt(it.join(","))
-  let orderedNumericFirstMin = parseSql("select * from numeric-first-strings.csv group by Name min Flag order by Flag", resolve)
+  let orderedNumericFirstMin = parseSql("select * from numeric-first-strings.csv group by Name min Flag order by min_Flag", resolve)
   doAssert runStaged(orderedNumericFirstMin) == directRows(orderedNumericFirstMin).mapIt(it.join(","))
   var stagedFilterRaised = false
   try:
@@ -311,11 +311,18 @@ when isMainModule:
   doAssert sorted(runStaged(mixedString)) == sorted(directRows(mixedString).mapIt(it.join(",")))
   doAssert sorted(runStaged(mixedString)) == sorted(@["Ada,3,10,10", "Bob,1,13,8"])
   let mixedKinds = parseSql("select * from t.csv group by Name sum Value, min Value", resolve)
+  doAssert resultSchema(mixedKinds) == @["Name", "count", "sum_Value", "min_Value"]
   doAssert runStaged(mixedKinds) == directRows(mixedKinds).mapIt(it.join(","))
   doAssert runStaged(mixedKinds) == @["Ada,2,17,7", "Bob,1,20,20"]
   let mixedIntString = parseSql("select * from strings.csv group by Name sum Value, min Flag", resolve)
+  doAssert resultSchema(mixedIntString) == @["Name", "count", "sum_Value", "min_Flag"]
   doAssert runStaged(mixedIntString) == directRows(mixedIntString).mapIt(it.join(","))
   doAssert runStaged(mixedIntString) == @["Ada,3,33,10", "Bob,1,13,8"]
+  let singleKind = parseSql("select * from t.csv group by Name sum Value", resolve)
+  doAssert resultSchema(singleKind) == @["Name", "count", "sum_Value"]
+  let orderedQualified = parseSql("select * from t.csv group by Name sum Value order by sum_Value desc", resolve)
+  doAssert runStaged(orderedQualified) == directRows(orderedQualified).mapIt(it.join(","))
+  doAssert runStaged(orderedQualified) == @["Bob,1,20", "Ada,2,17"]
   let mixedAvgString = parseSql("select * from strings.csv group by Name avg Value, max Flag", resolve)
   doAssert runStaged(mixedAvgString) == directRows(mixedAvgString).mapIt(it.join(","))
   doAssert runStaged(mixedAvgString) == @["Ada,3,11,x", "Bob,1,13,8"]
@@ -340,7 +347,7 @@ when isMainModule:
   let groupedCount = parseSql("select * from t.csv group by Name sum Value order by count desc", resolve)
   doAssert runStaged(groupedCount) == directRows(groupedCount).mapIt(it.join(","))
   doAssert runStaged(groupedCount) == @["Ada,2,17", "Bob,1,20"]
-  let groupedValue = parseSql("select * from t.csv group by Name sum Value order by Value", resolve)
+  let groupedValue = parseSql("select * from t.csv group by Name sum Value order by sum_Value", resolve)
   doAssert runStaged(groupedValue) == directRows(groupedValue).mapIt(it.join(","))
   doAssert runStaged(groupedValue) == @["Ada,2,17", "Bob,1,20"]
   try:
