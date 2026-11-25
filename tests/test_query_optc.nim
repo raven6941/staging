@@ -163,6 +163,18 @@ proc parseRows*(csv: string; delim = ','): seq[seq[string]] =
   for line in csv.strip.splitLines[1 .. ^1]:
     if line.len > 0: result.add(line.split(delim))
 
+proc sourceKinds(csv: string; schema: seq[string]; delim: char): seq[bool] =
+  ## Classify a source column as string when any data value is not an integer.
+  result = newSeq[bool](schema.len)
+  for row in parseRows(csv, delim):
+    for i in 0 ..< schema.len:
+      if result[i]: continue
+      if i >= row.len:
+        result[i] = true
+      else:
+        try: discard parseInt(row[i])
+        except ValueError: result[i] = true
+
 proc refText(r: Ref; row: seq[string]; schema: seq[string]): string =
   if r.kind == rkField: row[lookup(schema, r.name)]
   elif r.value.kind == fkString: r.value.str.data.staticVal
@@ -174,12 +186,22 @@ proc refKind(r: Ref; schema: seq[string]; kinds: seq[bool]): FieldKind =
   else: r.value.kind
 
 proc columnKinds(q: Operator): seq[bool] =
-  let schema = resultSchema(q)
-  let rows = directRows(q)
-  if rows.len == 0: return newSeq[bool](schema.len)
-  for cell in rows[0]:
-    try: discard parseInt(cell); result.add(false)
-    except ValueError: result.add(true)
+  case q.kind
+  of okScan: result = sourceKinds(q.csv, q.schema, q.delim)
+  of okFilter, okPrintCSV, okSort: result = columnKinds(q.parent)
+  of okProject:
+    let parentSchema = resultSchema(q.parent)
+    let input = if q.inputSchema.len == 0: q.outputSchema else: q.inputSchema
+    let parentKinds = columnKinds(q.parent)
+    for name in input: result.add(parentKinds[lookup(parentSchema, name)])
+  of okJoin, okHashJoin: result = columnKinds(q.parent) & columnKinds(q.right)
+  of okGroup:
+    let parentSchema = resultSchema(q.parent)
+    let parentKinds = columnKinds(q.parent)
+    for name in q.keys: result.add(parentKinds[lookup(parentSchema, name)])
+    result.add(false)
+    for name in q.aggregates:
+      result.add(if q.aggKind in {akMin, akMax}: parentKinds[lookup(parentSchema, name)] else: false)
 
 proc directRows(q: Operator): seq[seq[string]] =
   case q.kind
@@ -220,6 +242,9 @@ proc directRows(q: Operator): seq[seq[string]] =
         if good: result.add(a & b)
   of okGroup:
     let ps = resultSchema(q.parent); let kinds = columnKinds(q.parent)
+    if q.aggKind in {akSum, akAvg}:
+      for n in q.aggregates:
+        doAssert not kinds[lookup(ps, n)], "aggregate field must be integer"
     var groups = initTable[string, seq[string]]()
     for row in directRows(q.parent):
       let k = q.keys.mapIt(row[lookup(ps, it)]).join("\x1f")
@@ -409,12 +434,9 @@ proc execOpWith(q: Operator; emitRow: proc(f: seq[RField]): Rep[Unit];
   proc orB(a,b: Rep[bool]): Rep[bool] = dynamic[bool](QueryNode(kind:nkOr,boolA:a,boolB:b))
   proc pr(xs: seq[RField]): Rep[Unit] = dynamic[Unit](QueryNode(kind:nkPrint,fields:xs))
   proc addMany(xs: seq[Rep[Unit]]): Rep[Unit] = seqMany(xs)
-  proc firstData(csv: string; col: int; delim: char): string = csv.strip.splitLines[1].split(delim)[col]
   proc stringCols(csv: string; schema: seq[string]): seq[bool] =
     let delim = if q.kind == okScan: q.delim else: q.parent.delim
-    for i in 0 ..< schema.len:
-      try: discard parseInt(firstData(csv, i, delim)); result.add(false)
-      except ValueError: result.add(true)
+    sourceKinds(csv, schema, delim)
   proc row(sc: Scanner; csv: string; schema: seq[string]; kinds: seq[bool]; delim: char): seq[RField] =
     for i in 0 ..< schema.len:
       let d = if i == schema.high: '\n' else: delim
