@@ -47,4 +47,5 @@ tests/test_fusion_horizontal
 tests/test_shonan
 tests/test_query
 tests/test_query_optc
+tests/test_sql_parser
 tests/test_veccomplex_arith
