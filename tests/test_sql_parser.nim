@@ -134,6 +134,17 @@ proc predicateExpression(p: var Parser): Predicate =
   result = p.andExpression
   while p.acceptWord("or"): result = predOr(result, p.andExpression)
 
+proc aggregateKind(p: var Parser): AggKind =
+  let t = p.current
+  if t.kind != tkWord: raise p.parseError(t, "sum, avg, min, or max")
+  case t.text
+  of "sum": result = akSum
+  of "avg": result = akAvg
+  of "min": result = akMin
+  of "max": result = akMax
+  else: raise p.parseError(t, "sum, avg, min, or max")
+  discard p.take
+
 proc statement(p: var Parser): Operator =
   discard p.want(tkWord, "select")
   var outNames, inNames: seq[string]
@@ -147,9 +158,9 @@ proc statement(p: var Parser): Operator =
   if p.acceptWord("group"):
     discard p.want(tkWord, "by")
     let keys = p.fieldNames
-    discard p.want(tkWord, "sum")
+    let kind = p.aggregateKind
     let aggs = p.fieldNames
-    result = group(keys, aggs, result)
+    result = group(keys, aggs, result, kind)
   var orderKeys: seq[string] = @[]
   var orderDirs: seq[bool] = @[]
   if p.acceptWord("order"):
@@ -186,8 +197,11 @@ when isMainModule:
   expectShape("select Name from t.csv where Flag='yes'", "Project(Name;Name;Filter(Scan(Name,Flag,Value)))", resolve)
   expectShape("select * from nestedloops t.csv join (select Name as Name1 from t.csv)", "Join(Scan(Name,Flag,Value);Project(Name1;Name;Scan(Name,Flag,Value)))", resolve)
   expectShape("select * from t.csv join (select Name from t.csv)", "HashJoin(Scan(Name,Flag,Value);Project(Name;Name;Scan(Name,Flag,Value)))", resolve)
-  expectShape("select * from t.csv group by Name sum Value", "Group(Name;Value;Scan(Name,Flag,Value))", resolve)
-  expectShape("select * from t.csv group by Name,Flag sum Value", "Group(Name,Flag;Value;Scan(Name,Flag,Value))", resolve)
+  expectShape("select * from t.csv group by Name sum Value", "Group(Name;sum:Value;Scan(Name,Flag,Value))", resolve)
+  expectShape("select * from t.csv group by Name,Flag sum Value", "Group(Name,Flag;sum:Value;Scan(Name,Flag,Value))", resolve)
+  expectShape("select * from t.csv group by Name avg Value", "Group(Name;avg:Value;Scan(Name,Flag,Value))", resolve)
+  expectShape("select * from t.csv group by Name min Value", "Group(Name;min:Value;Scan(Name,Flag,Value))", resolve)
+  expectShape("select * from t.csv group by Name max Value", "Group(Name;max:Value;Scan(Name,Flag,Value))", resolve)
   expectShape("select * from t.csv order by Value desc", "Sort(Value:desc;Scan(Name,Flag,Value))", resolve)
   doAssert runStaged(parseSql("select * from t.csv where Flag='yes'", resolve)) == @["Ada,yes,10", "Ada,yes,7"]
   # Load-bearing: the following assertion fails if the residual Lt branch is
@@ -214,6 +228,26 @@ when isMainModule:
   doAssert directRows(parseSql("select * from nestedloops t.csv join (select Name as Name1 from t.csv)", resolve)).len == 9
   doAssert directRows(parseSql("select * from t.csv join (select Name from t.csv)", resolve)).len == 5
   doAssert sorted(runStaged(parseSql("select * from t.csv group by Name sum Value", resolve))) == sorted(@["Ada,2,17", "Bob,1,20"])
+  for kind in [akAvg, akMin, akMax]:
+    let kindName = aggName(kind)
+    let grouped = parseSql("select * from t.csv group by Name " & kindName & " Value", resolve)
+    let staged = sorted(runStaged(grouped))
+    let oracle = sorted(directRows(grouped).mapIt(it.join(",")))
+    doAssert staged == oracle, kindName & ": " & $staged & " != " & $oracle
+    let expected = case kind
+      of akAvg: @[
+        "Ada,2,8", "Bob,1,20"]
+      of akMin: @["Ada,2,7", "Bob,1,20"]
+      of akMax: @["Ada,2,10", "Bob,1,20"]
+      else: @[]
+    doAssert staged == sorted(expected)
+  let orderedAverage = parseSql("select * from t.csv group by Name avg Value order by Value", resolve)
+  doAssert runStaged(orderedAverage) == directRows(orderedAverage).mapIt(it.join(","))
+  doAssert runStaged(orderedAverage) == @["Ada,2,8", "Bob,1,20"]
+  try:
+    discard runStaged(parseSql("select * from t.csv group by Name sum Flag", resolve))
+    doAssert false
+  except AssertionDefect: discard
   let multiKey = parseSql("select * from multi.csv group by Dept,Name sum Value", resolve)
   doAssert sorted(runStaged(multiKey)) == sorted(directRows(multiKey).mapIt(it.join(",")))
   doAssert sorted(runStaged(multiKey)) == sorted(@["10,Ada,2,7", "10,Bob,1,3"])
