@@ -294,7 +294,10 @@ proc execOp(q: Operator): string =
     let schema = resultSchema(q.parent); let kinds = schema.mapIt(it in q.keys)
     let used=iv("used"); let pos=iv("slot"); let found=iv("found"); let outPos=iv("outPos")
     let occupied=ia("occupied"); let slotIndex=ia("slotIndex"); let keyBuf=sa("groupKeys"); let countBuf=ia("groupCounts")
-    let sumBuf=ia("groupSums"); let outKey=sa("outKeys"); let outCount=ia("outCounts"); let outSum=ia("outSums"); let inputKey=sa("inputKey"); let inputAgg=(0 ..< q.aggregates.len).mapIt(ia("inputAgg" & $it)); let inputPos=iv("inputPos")
+    let sumBuf=ia("groupSums"); let outKey=sa("outKeys"); let outCount=ia("outCounts"); let outSum=ia("outSums"); let inputKey=sa("inputKey")
+    var inputAgg: seq[Arr[int]] = @[]
+    for k in 0 ..< q.aggregates.len: inputAgg.add(ia("inputAgg" & $k))
+    let inputPos=iv("inputPos")
     proc consume(f: seq[RField]): Rep[Unit] =
       let keyField = RString(data:sr(inputKey,vr(inputPos)))
       var h: Rep[int] = fieldHash(keyField)
@@ -330,9 +333,20 @@ proc execOp(q: Operator): string =
     let ls=resultSchema(q.parent); let rs=resultSchema(q.right); let keys=keyNames(ls,rs)
     let lk=stringCols(q.parent.csv,ls); let rk=stringCols(q.right.csv,rs)
     let used=iv("joinUsed"); let pos=iv("joinPos"); let occupied=ia("joinOccupied"); let hkeys=sa("joinKeys")
-    let hrowsI = (0 ..< ls.len).mapIt(ia("joinI" & $it)); let hrowsS = (0 ..< ls.len).mapIt(sa("joinS" & $it))
-    let leftTmpI = (0 ..< ls.len).mapIt(ia("leftTmpI" & $it)); let leftTmpS = (0 ..< ls.len).mapIt(sa("leftTmpS" & $it)); let leftTmpPos=iv("leftTmpPos")
-    let rightTmpI = (0 ..< rs.len).mapIt(ia("rightTmpI" & $it)); let rightTmpS = (0 ..< rs.len).mapIt(sa("rightTmpS" & $it)); let rightTmpPos=iv("rightTmpPos")
+    var hrowsI: seq[Arr[int]] = @[]
+    for k in 0 ..< ls.len: hrowsI.add(ia("joinI" & $k))
+    var hrowsS: seq[Arr[string]] = @[]
+    for k in 0 ..< ls.len: hrowsS.add(sa("joinS" & $k))
+    var leftTmpI: seq[Arr[int]] = @[]
+    for k in 0 ..< ls.len: leftTmpI.add(ia("leftTmpI" & $k))
+    var leftTmpS: seq[Arr[string]] = @[]
+    for k in 0 ..< ls.len: leftTmpS.add(sa("leftTmpS" & $k))
+    let leftTmpPos=iv("leftTmpPos")
+    var rightTmpI: seq[Arr[int]] = @[]
+    for k in 0 ..< rs.len: rightTmpI.add(ia("rightTmpI" & $k))
+    var rightTmpS: seq[Arr[string]] = @[]
+    for k in 0 ..< rs.len: rightTmpS.add(sa("rightTmpS" & $k))
+    let rightTmpPos=iv("rightTmpPos")
     let rscan= scannerNew(q.right.csv); vars.add(rscan.pos)
     proc hashOf(fs: seq[RField]; schema: seq[string]): Rep[int] =
       result = fieldHash(fs[lookup(schema,keys[0])].str)
