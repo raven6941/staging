@@ -150,7 +150,20 @@ proc statement(p: var Parser): Operator =
     discard p.want(tkWord, "sum")
     let aggs = p.fieldNames
     result = group(keys, aggs, result)
+  var orderKeys: seq[string] = @[]
+  var orderDirs: seq[bool] = @[]
+  if p.acceptWord("order"):
+    discard p.want(tkWord, "by")
+    while true:
+      orderKeys.add(p.want(tkWord).text)
+      if p.acceptWord("desc"): orderDirs.add(true)
+      else:
+        discard p.acceptWord("asc")
+        orderDirs.add(false)
+      if p.current.kind != tkComma: break
+      discard p.take
   if outNames.len > 0: result = project(outNames, result, inNames)
+  if orderKeys.len > 0: result = orderBy(orderKeys, orderDirs, result)
 
 proc parseSql*(sql: string; resolveTable: proc(ident: string): Operator): Operator =
   var p = Parser(input: sql, tokens: tokenize(sql), resolveTable: resolveTable)
@@ -175,6 +188,7 @@ when isMainModule:
   expectShape("select * from t.csv join (select Name from t.csv)", "HashJoin(Scan(Name,Flag,Value);Project(Name;Name;Scan(Name,Flag,Value)))", resolve)
   expectShape("select * from t.csv group by Name sum Value", "Group(Name;Value;Scan(Name,Flag,Value))", resolve)
   expectShape("select * from t.csv group by Name,Flag sum Value", "Group(Name,Flag;Value;Scan(Name,Flag,Value))", resolve)
+  expectShape("select * from t.csv order by Value desc", "Sort(Value:desc;Scan(Name,Flag,Value))", resolve)
   doAssert runStaged(parseSql("select * from t.csv where Flag='yes'", resolve)) == @["Ada,yes,10", "Ada,yes,7"]
   # Load-bearing: the following assertion fails if the residual Lt branch is
   # stubbed out (verified by stubbing it once, observing the failure, restoring).
@@ -204,6 +218,20 @@ when isMainModule:
   doAssert sorted(runStaged(multiKey)) == sorted(directRows(multiKey).mapIt(it.join(",")))
   doAssert sorted(runStaged(multiKey)) == sorted(@["10,Ada,2,7", "10,Bob,1,3"])
   doAssert runStaged(parseSql("select * from ? schema Phrase,Year,MatchCount,VolumeCount delim \\t where Phrase='Auswanderung'", resolve)) == @["Auswanderung,2000,3,4"]
+  let orderedValue = parseSql("select * from t.csv order by Value desc", resolve)
+  doAssert runStaged(orderedValue) == directRows(orderedValue).mapIt(it.join(","))
+  doAssert runStaged(orderedValue) == @["Bob,no,20", "Ada,yes,10", "Ada,yes,7"]
+  let orderedMixed = parseSql("select * from t.csv order by Name asc, Value desc", resolve)
+  doAssert runStaged(orderedMixed) == directRows(orderedMixed).mapIt(it.join(","))
+  doAssert runStaged(orderedMixed) == @["Ada,yes,10", "Ada,yes,7", "Bob,no,20"]
+  let orderedDefault = parseSql("select * from t.csv order by Name", resolve)
+  doAssert runStaged(orderedDefault) == directRows(orderedDefault).mapIt(it.join(","))
+  let groupedCount = parseSql("select * from t.csv group by Name sum Value order by count desc", resolve)
+  doAssert runStaged(groupedCount) == directRows(groupedCount).mapIt(it.join(","))
+  doAssert runStaged(groupedCount) == @["Ada,2,17", "Bob,1,20"]
+  let groupedValue = parseSql("select * from t.csv group by Name sum Value order by Value", resolve)
+  doAssert runStaged(groupedValue) == directRows(groupedValue).mapIt(it.join(","))
+  doAssert runStaged(groupedValue) == @["Ada,2,17", "Bob,1,20"]
   try:
     discard parseSql("select Name t.csv", resolve)
     doAssert false

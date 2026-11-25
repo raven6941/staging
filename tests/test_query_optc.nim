@@ -76,11 +76,13 @@ type
     kind*: PredicateKind
     left*, right*: Ref
     a*, b*: Predicate
-  OpKind* = enum okScan, okFilter, okProject, okJoin, okHashJoin, okGroup, okPrintCSV
+  OpKind* = enum okScan, okFilter, okProject, okJoin, okHashJoin, okGroup, okSort, okPrintCSV
   Operator* = ref object
     kind: OpKind
     csv, csvRight: string
     schema, outputSchema, inputSchema, keys, aggregates: seq[string]
+    sortKeys: seq[string]
+    sortDesc: seq[bool]
     delim: char
     predicate: Predicate
     parent, right: Operator
@@ -125,6 +127,7 @@ proc resultSchema*(q: Operator): seq[string] =
   of okProject: q.outputSchema
   of okJoin, okHashJoin: resultSchema(q.parent) & resultSchema(q.right)
   of okGroup: q.keys & @["count"] & q.aggregates
+  of okSort: resultSchema(q.parent)
 
 proc opShape*(q: Operator): string =
   ## A compact structural view used by the SQL front-end tests.
@@ -135,10 +138,17 @@ proc opShape*(q: Operator): string =
   of okJoin: "Join(" & opShape(q.parent) & ";" & opShape(q.right) & ")"
   of okHashJoin: "HashJoin(" & opShape(q.parent) & ";" & opShape(q.right) & ")"
   of okGroup: "Group(" & q.keys.join(",") & ";" & q.aggregates.join(",") & ";" & opShape(q.parent) & ")"
+  of okSort:
+    "Sort(" & q.sortKeys.mapIt(it & ":" & (if q.sortDesc[q.sortKeys.find(it)]: "desc" else: "asc")).join(",") & ";" & opShape(q.parent) & ")"
   of okPrintCSV: "Print(" & opShape(q.parent) & ")"
 
 proc lookup(s: seq[string]; n: string): int =
   result = s.find(n); doAssert result >= 0, "unknown field " & n
+
+proc orderBy*(keys: seq[string]; dirs: seq[bool]; q: Operator): Operator =
+  let schema = resultSchema(q)
+  for key in keys: discard lookup(schema, key)
+  Operator(kind: okSort, sortKeys: keys, sortDesc: dirs, parent: q)
 
 proc parseRows*(csv: string; delim = ','): seq[seq[string]] =
   for line in csv.strip.splitLines[1 .. ^1]:
@@ -208,6 +218,24 @@ proc directRows(q: Operator): seq[seq[string]] =
         groups[k][q.keys.len] = $(parseInt(groups[k][q.keys.len]) + 1)
         for j, n in q.aggregates: groups[k][q.keys.len + 1 + j] = $(parseInt(groups[k][q.keys.len + 1 + j]) + parseInt(row[lookup(ps, n)]))
     for x in groups.values: result.add(x)
+  of okSort:
+    result = directRows(q.parent)
+    let schema = resultSchema(q.parent)
+    let kinds = columnKinds(q.parent)
+    proc less(a, b: seq[string]): bool =
+      for k, name in q.sortKeys:
+        let i = lookup(schema, name)
+        if a[i] == b[i]: continue
+        let x = if kinds[i]: a[i] < b[i] else: parseInt(a[i]) < parseInt(b[i])
+        return if q.sortDesc[k]: not x else: x
+      false
+    for i in 1 ..< result.len:
+      let row = result[i]
+      var j = i
+      while j > 0 and less(row, result[j - 1]):
+        result[j] = result[j - 1]
+        dec j
+      result[j] = row
   of okPrintCSV: result = directRows(q.parent)
 
 # Residual constructors.  In particular, Scanner position is a residual Var,
@@ -316,14 +344,16 @@ proc emitDecl(a: Arr[int]): string =
 proc emitDecl(a: Arr[string]): string =
   let n = QueryNode(a.node); "var " & n.name & " = newSeq[string](" & emitInt(n.init) & ")"
 
-proc execOp(q: Operator): string =
+proc execOpWith(q: Operator; emitRow: proc(f: seq[RField]): Rep[Unit];
+    sharedVars: var seq[Var[int]]; sharedInts: var seq[Arr[int]];
+    sharedStrings: var seq[Arr[string]]; bodyOut: var Rep[Unit]; root: bool): string =
   ## Build the residual from the operator's fields.  The only host-side work
   ## here is choosing typed columns from the CSV fixture; all scanning,
   ## hashing, probing, buffering, and output are Rep nodes.
   let cap = 64
-  var vars: seq[Var[int]] = @[]
-  var ints: seq[Arr[int]] = @[]
-  var strings: seq[Arr[string]] = @[]
+  var vars = sharedVars
+  var ints = sharedInts
+  var strings = sharedStrings
   proc iv(name: string; x = 0): Var[int] =
     result = newVar(staticInt(x), proc(v: Rep[int]): IRNode = QueryNode(kind:nkVarDecl,name:name,init:v)); vars.add(result)
   proc ia(name: string): Arr[int] =
@@ -376,7 +406,61 @@ proc execOp(q: Operator): string =
     of pkAnd: result = andB(predicateRep(p.a, f, schema, kinds), predicateRep(p.b, f, schema, kinds))
     of pkOr: result = orB(predicateRep(p.a, f, schema, kinds), predicateRep(p.b, f, schema, kinds))
   var body: Rep[Unit]
-  if q.kind == okGroup:
+  if q.kind == okSort:
+    let schema = resultSchema(q.parent)
+    let kinds = columnKinds(q.parent)
+    var outS: seq[Arr[string]] = @[]
+    var outI: seq[Arr[int]] = @[]
+    for i, isString in kinds:
+      if isString: outS.add(sa("sortS" & $i)); outI.add(nil)
+      else: outS.add(nil); outI.add(ia("sortI" & $i))
+    let used = iv("sortUsed")
+    let pos = iv("sortPos")
+    let current = iv("sortCurrent")
+    let scanPos = iv("sortScan")
+    let order = ia("sortOrder")
+    proc consume(f: seq[RField]): Rep[Unit] =
+      var writes: seq[Rep[Unit]] = @[]
+      var si = 0
+      var ii = 0
+      for i, fld in f:
+        if kinds[i]: writes.add(sw(outS[i], vr(used), fld.str.data)); inc si
+        else: writes.add(aw(outI[i], vr(used), fld.int.value)); inc ii
+      writes.add(vw(used, intAdd(vr(used), staticInt(1))))
+      addMany(writes)
+    var parentBody: Rep[Unit]
+    discard execOpWith(q.parent, consume, vars, ints, strings, parentBody, false)
+    proc lessRows(a, b: Rep[int]): Rep[bool] =
+      var less: Rep[bool] = liftNow(false)
+      var equal: Rep[bool] = liftNow(true)
+      for k, name in q.sortKeys:
+        let i = lookup(schema, name)
+        let av = if kinds[i]: RField(kind:fkString, str:RString(data:sr(outS[i], ar(order, a))))
+                 else: RField(kind:fkInt, int:RInt(value:ar(outI[i], ar(order, a))))
+        let bv = if kinds[i]: RField(kind:fkString, str:RString(data:sr(outS[i], ar(order, b))))
+                 else: RField(kind:fkInt, int:RInt(value:ar(outI[i], ar(order, b))))
+        let lt = if kinds[i]: stringLess(av.str, bv.str) else: ltI(av.int.value, bv.int.value)
+        let eq = if kinds[i]: stringCompare(av.str, bv.str) else: eqI(av.int.value, bv.int.value)
+        let directed = if q.sortDesc[k]: andB(equal, if kinds[i]: stringLess(bv.str, av.str) else: ltI(bv.int.value, av.int.value)) else: andB(equal, lt)
+        less = orB(less, directed)
+        equal = andB(equal, eq)
+      less
+    let initOrder = whileLoop(proc():Rep[bool]=ltI(vr(pos),vr(used)), proc():Rep[Unit]=
+      seqs(aw(order,vr(pos),vr(pos)),vw(pos,intAdd(vr(pos),staticInt(1)))))
+    let sortLoop = whileLoop(proc():Rep[bool]=ltI(vr(scanPos),vr(used)), proc():Rep[Unit]=
+      seqs(vw(current,ar(order,vr(scanPos))), seqs(vw(pos,vr(scanPos)),
+        seqs(whileLoop(proc():Rep[bool]=andB(ltI(staticInt(0),vr(pos)),lessRows(vr(current),ar(order,intAdd(vr(pos),staticInt(-1))))), proc():Rep[Unit]=
+          seqs(aw(order,vr(pos),ar(order,intAdd(vr(pos),staticInt(-1)))),vw(pos,intAdd(vr(pos),staticInt(-1))))),
+          seqs(aw(order,vr(pos),vr(current)),vw(scanPos,intAdd(vr(scanPos),staticInt(1))))))))
+    var output: seq[Rep[Unit]] = @[]
+    let outLoop = whileLoop(proc():Rep[bool]=ltI(vr(pos),vr(used)), proc():Rep[Unit]=
+      var fields: seq[RField] = @[]
+      for i, isString in kinds:
+        if isString: fields.add(RField(kind:fkString,str:RString(data:sr(outS[i],ar(order,vr(pos))))))
+        else: fields.add(RField(kind:fkInt,int:RInt(value:ar(outI[i],ar(order,vr(pos))))))
+      seqs(pr(fields),vw(pos,intAdd(vr(pos),staticInt(1)))))
+    body = seqs(parentBody, seqs(initOrder, seqs(vw(scanPos,staticInt(1)), seqs(sortLoop, seqs(vw(pos,staticInt(0)),outLoop)))))
+  elif q.kind == okGroup:
     let schema = resultSchema(q.parent)
     let stringKinds = stringCols(q.parent.csv, schema)
     var keyIndexes: seq[int] = @[]
@@ -481,7 +565,7 @@ proc execOp(q: Operator): string =
           fs.add(RField(kind:fkInt,int:RInt(value:ar(outKeyI[j],vr(outPos)))))
       fs.add(RField(kind:fkInt,int:RInt(value:ar(outCount,vr(outPos)))))
       for j in 0 ..< q.aggregates.len: fs.add(RField(kind:fkInt,int:RInt(value:ar(outSum,intAdd(intMul(vr(outPos),staticInt(q.aggregates.len)),staticInt(j))))))
-      seqs(pr(fs),vw(outPos,intAdd(vr(outPos),staticInt(1)))))
+      seqs(emitRow(fs),vw(outPos,intAdd(vr(outPos),staticInt(1)))))
     body = seqs(consumeAll,outLoop)
   elif q.kind == okHashJoin:
     let ls=resultSchema(q.parent); let rs=resultSchema(q.right); let keys=keyNames(ls,rs)
@@ -530,7 +614,7 @@ proc execOp(q: Operator): string =
         for j in 1 ..< keys.len: same=andB(same,stringCompare(RString(data:sr(hkeys,intAdd(intMul(vr(pos),staticInt(keys.len)),staticInt(j)))),sf[lookup(rs,keys[j])].str))
         var outputFields: seq[RField] = @[]
         for j in 0 ..< ls.len: outputFields.add(if lk[j]: RField(kind:fkString,str:RString(data:sr(hrowsS[j],vr(pos)))) else: RField(kind:fkInt,int:RInt(value:ar(hrowsI[j],vr(pos)))))
-        outputFields.add(sf); seqs(ifB(same,proc():Rep[Unit]=pr(outputFields),proc():Rep[Unit]=unit()),vw(pos,intMod(intAdd(vr(pos),staticInt(1)),staticInt(cap)))))
+        outputFields.add(sf); seqs(ifB(same,proc():Rep[Unit]=emitRow(outputFields),proc():Rep[Unit]=unit()),vw(pos,intMod(intAdd(vr(pos),staticInt(1)),staticInt(cap)))))
       seqs(addMany(xs),seqs(loop,vw(rightTmpPos,intAdd(vr(rightTmpPos),staticInt(1)))))))
     body=seqs(build,probe)
   elif q.kind == okFilter:
@@ -552,7 +636,7 @@ proc execOp(q: Operator): string =
         if kinds[i]: loaded.add(RField(kind: fkString, str: RString(data: sr(bs[si], vr(pos))))); inc si
         else: loaded.add(RField(kind: fkInt, int: RInt(value: ar(bi[ii], vr(pos))))); inc ii
       let same = predicateRep(q.predicate, loaded, schema, kinds)
-      seqs(addMany(writes), seqs(ifB(same, proc():Rep[Unit]=pr(loaded), proc():Rep[Unit]=unit()), vw(pos, intAdd(vr(pos), staticInt(1))))))
+      seqs(addMany(writes), seqs(ifB(same, proc():Rep[Unit]=emitRow(loaded), proc():Rep[Unit]=unit()), vw(pos, intAdd(vr(pos), staticInt(1))))))
   elif q.kind == okProject:
     let source = if q.parent.kind == okFilter: q.parent.parent else: q.parent
     let schema = resultSchema(source)
@@ -561,7 +645,7 @@ proc execOp(q: Operator): string =
     let emit = proc(f: seq[RField]): Rep[Unit] =
       var selected: seq[RField] = @[]
       for name in input: selected.add(f[lookup(schema,name)])
-      pr(selected)
+      emitRow(selected)
     if q.parent.kind == okFilter:
       let pred = q.parent.predicate
       # Buffer the scanned row first: the scanner Rep nodes advance the
@@ -600,18 +684,31 @@ proc execOp(q: Operator): string =
             doAssert left[li].kind == right[ri].kind, "join kind mismatch"
             let eq = if left[li].kind == fkString: stringCompare(left[li].str,right[ri].str) else: eqI(left[li].int.value,right[ri].int.value)
             same = andB(same,eq)
-        ifB(same, proc():Rep[Unit]=pr(left & right), proc():Rep[Unit]=unit())))
+        ifB(same, proc():Rep[Unit]=emitRow(left & right), proc():Rep[Unit]=unit())))
   else:
     let schema = resultSchema(if q.kind == okScan: q else: q.parent)
     let csv = if q.kind == okScan: q.csv else: q.parent.csv
     let kinds=stringCols(csv,schema)
-    body=scanRows(csv,schema,kinds,if q.kind == okScan: q.delim else: q.parent.delim,proc(f: seq[RField]):Rep[Unit]=pr(f))
+    body=scanRows(csv,schema,kinds,if q.kind == okScan: q.delim else: q.parent.delim,proc(f: seq[RField]):Rep[Unit]=emitRow(f))
   result = "import std/strutils\n\nproc compareStringChars(a,b: string): bool =\n  var i = 0\n  result = a.len == b.len\n  while result and i < a.len:\n    result = a[i] == b[i]\n    inc i\n\nproc hashString(a: string): int =\n  var i = 0\n  result = 0\n  while i < a.len:\n    result = result * 41 + ord(a[i])\n    inc i\n\nproc scannerNext(text: string; pos: var int; delim: char): string =\n  let start = pos\n  var stop = pos\n  while stop < text.len and text[stop] != delim: inc stop\n  result = text[start ..< stop]\n  if stop < text.len: inc stop\n  pos = stop\n\n"
+  bodyOut = body
+  sharedVars = vars
+  sharedInts = ints
+  sharedStrings = strings
+  if not root: return ""
   result = result.replace("proc hashString(a: string): int =", "proc compareStringLt(a,b: string): bool =\n  var i = 0\n  while i < a.len and i < b.len and a[i] == b[i]: inc i\n  if i == a.len or i == b.len: return a.len < b.len\n  result = a[i] < b[i]\n\nproc hashString(a: string): int =")
   for a in strings: result.add(emitDecl(a) & "\n")
   for a in ints: result.add(emitDecl(a) & "\n")
   for v in vars: result.add(emitDecl(v) & "\n")
   result.add(emitStmt(body) & "\n")
+
+proc execOp*(q: Operator): string =
+  var vars: seq[Var[int]] = @[]
+  var ints: seq[Arr[int]] = @[]
+  var strings: seq[Arr[string]] = @[]
+  var body: Rep[Unit]
+  proc printRow(f: seq[RField]): Rep[Unit] = dynamic[Unit](QueryNode(kind:nkPrint,fields:f))
+  result = execOpWith(q, printRow, vars, ints, strings, body, true)
 
 proc runStaged*(q: Operator): seq[string] =
   let d = getTempDir()/("query-optc-" & $getCurrentProcessId()); createDir(d)
