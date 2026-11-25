@@ -82,7 +82,7 @@ type
     kind: OpKind
     csv, csvRight: string
     schema, outputSchema, inputSchema, keys, aggregates: seq[string]
-    aggKind: AggKind
+    aggKinds: seq[AggKind]
     sortKeys: seq[string]
     sortDesc: seq[bool]
     delim: char
@@ -115,8 +115,12 @@ proc project*(s: seq[string]; q: Operator; inputSchema: seq[string] = @[]): Oper
     inputSchema: (if inputSchema.len == 0: s else: inputSchema), parent: q)
 proc join*(a, b: Operator): Operator = Operator(kind: okJoin, parent: a, right: b)
 proc hashJoin*(a, b: Operator): Operator = Operator(kind: okHashJoin, parent: a, right: b)
+proc groupKinds*(keys, aggs: seq[string]; q: Operator; kinds: seq[AggKind]): Operator
 proc group*(keys, aggs: seq[string]; q: Operator; kind = akSum): Operator =
-  Operator(kind: okGroup, keys: keys, aggregates: aggs, aggKind: kind, parent: q)
+  groupKinds(keys, aggs, q, newSeqWith(aggs.len, kind))
+proc groupKinds*(keys, aggs: seq[string]; q: Operator; kinds: seq[AggKind]): Operator =
+  doAssert kinds.len == aggs.len
+  Operator(kind: okGroup, keys: keys, aggregates: aggs, aggKinds: kinds, parent: q)
 proc aggName*(kind: AggKind): string =
   case kind
   of akSum: "sum"
@@ -146,7 +150,10 @@ proc opShape*(q: Operator): string =
   of okProject: "Project(" & q.outputSchema.join(",") & ";" & q.inputSchema.join(",") & ";" & opShape(q.parent) & ")"
   of okJoin: "Join(" & opShape(q.parent) & ";" & opShape(q.right) & ")"
   of okHashJoin: "HashJoin(" & opShape(q.parent) & ";" & opShape(q.right) & ")"
-  of okGroup: "Group(" & q.keys.join(",") & ";" & aggName(q.aggKind) & ":" & q.aggregates.join(",") & ";" & opShape(q.parent) & ")"
+  of okGroup:
+    var aggregateShape: seq[string] = @[]
+    for j, name in q.aggregates: aggregateShape.add(aggName(q.aggKinds[j]) & ":" & name)
+    "Group(" & q.keys.join(",") & ";" & aggregateShape.join(",") & ";" & opShape(q.parent) & ")"
   of okSort:
     "Sort(" & q.sortKeys.mapIt(it & ":" & (if q.sortDesc[q.sortKeys.find(it)]: "desc" else: "asc")).join(",") & ";" & opShape(q.parent) & ")"
   of okPrintCSV: "Print(" & opShape(q.parent) & ")"
@@ -200,8 +207,8 @@ proc columnKinds(q: Operator): seq[bool] =
     let parentKinds = columnKinds(q.parent)
     for name in q.keys: result.add(parentKinds[lookup(parentSchema, name)])
     result.add(false)
-    for name in q.aggregates:
-      result.add(if q.aggKind in {akMin, akMax}: parentKinds[lookup(parentSchema, name)] else: false)
+    for j, name in q.aggregates:
+      result.add(if q.aggKinds[j] in {akMin, akMax}: parentKinds[lookup(parentSchema, name)] else: false)
 
 proc directRows(q: Operator): seq[seq[string]] =
   case q.kind
@@ -242,8 +249,8 @@ proc directRows(q: Operator): seq[seq[string]] =
         if good: result.add(a & b)
   of okGroup:
     let ps = resultSchema(q.parent); let kinds = columnKinds(q.parent)
-    if q.aggKind in {akSum, akAvg}:
-      for n in q.aggregates:
+    for j, n in q.aggregates:
+      if q.aggKinds[j] in {akSum, akAvg}:
         doAssert not kinds[lookup(ps, n)], "aggregate field must be integer"
     # Insertion-ordered: plain Table iteration order is Nim-version
     # dependent (2.0.8 yields Bob before Ada here), while the staged
@@ -262,7 +269,7 @@ proc directRows(q: Operator): seq[seq[string]] =
           if kinds[aggregateIndex]:
             let value = row[aggregateIndex]
             let current = groups[k][valueIndex]
-            case q.aggKind
+            case q.aggKinds[j]
             of akMin:
               if value < current: groups[k][valueIndex] = value
             of akMax:
@@ -271,14 +278,14 @@ proc directRows(q: Operator): seq[seq[string]] =
           else:
             let value = parseInt(row[aggregateIndex])
             let current = parseInt(groups[k][valueIndex])
-            case q.aggKind
+            case q.aggKinds[j]
             of akSum, akAvg: groups[k][valueIndex] = $(current + value)
             of akMin: groups[k][valueIndex] = $(min(current, value))
             of akMax: groups[k][valueIndex] = $(max(current, value))
     for x in groups.mvalues:
-      if q.aggKind == akAvg:
-        let count = parseInt(x[q.keys.len])
-        for j in 0 ..< q.aggregates.len:
+      let count = parseInt(x[q.keys.len])
+      for j in 0 ..< q.aggregates.len:
+        if q.aggKinds[j] == akAvg:
           let i = q.keys.len + 1 + j
           x[i] = $(parseInt(x[i]) div count)
       result.add(x)
@@ -620,7 +627,7 @@ proc execOpWith(q: Operator; emitRow: proc(f: seq[RField]): Rep[Unit];
           for j,n in q.aggregates:
             if aggIsString[j]:
               let current = sr(outAggS[j], compact); let incoming = sr(inputAggS[j],vr(inputPos))
-              case q.aggKind
+              case q.aggKinds[j]
               of akMin: xs.add(ifB(stringLess(RString(data:incoming),RString(data:current)), proc():Rep[Unit]=sw(outAggS[j],compact,incoming), proc():Rep[Unit]=unit()))
               of akMax: xs.add(ifB(stringLess(RString(data:current),RString(data:incoming)), proc():Rep[Unit]=sw(outAggS[j],compact,incoming), proc():Rep[Unit]=unit()))
               of akSum, akAvg: doAssert false, "aggregate field must be integer"
@@ -628,7 +635,7 @@ proc execOpWith(q: Operator; emitRow: proc(f: seq[RField]): Rep[Unit];
               let aggregateIndex = intAdd(intMul(compact,staticInt(q.aggregates.len)),staticInt(j))
               let current = ar(outAgg, aggregateIndex)
               let incoming = ar(inputAgg[j],vr(inputPos))
-              case q.aggKind
+              case q.aggKinds[j]
               of akSum, akAvg: xs.add(aw(outAgg,aggregateIndex,intAdd(current,incoming)))
               of akMin: xs.add(ifB(ltI(incoming,current), proc():Rep[Unit]=aw(outAgg,aggregateIndex,incoming), proc():Rep[Unit]=unit()))
               of akMax: xs.add(ifB(ltI(current,incoming), proc():Rep[Unit]=aw(outAgg,aggregateIndex,incoming), proc():Rep[Unit]=unit()))
@@ -658,7 +665,7 @@ proc execOpWith(q: Operator; emitRow: proc(f: seq[RField]): Rep[Unit];
           fs.add(RField(kind:fkString,str:RString(data:sr(outAggS[j],vr(outPos)))))
         else:
           let aggregate = ar(outAgg,intAdd(intMul(vr(outPos),staticInt(q.aggregates.len)),staticInt(j)))
-          let value = if q.aggKind == akAvg: intDiv(aggregate, ar(outCount,vr(outPos))) else: aggregate
+          let value = if q.aggKinds[j] == akAvg: intDiv(aggregate, ar(outCount,vr(outPos))) else: aggregate
           fs.add(RField(kind:fkInt,int:RInt(value:value)))
       seqs(emitRow(fs),vw(outPos,intAdd(vr(outPos),staticInt(1)))))
     body = seqs(consumeAll,outLoop)

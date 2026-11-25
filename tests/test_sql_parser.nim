@@ -145,6 +145,9 @@ proc aggregateKind(p: var Parser): AggKind =
   else: raise p.parseError(t, "sum, avg, min, or max")
   discard p.take
 
+proc isAggregateWord(t: Token): bool =
+  t.kind == tkWord and t.text in ["sum", "avg", "min", "max"]
+
 proc statement(p: var Parser): Operator =
   discard p.want(tkWord, "select")
   var outNames, inNames: seq[string]
@@ -158,9 +161,21 @@ proc statement(p: var Parser): Operator =
   if p.acceptWord("group"):
     discard p.want(tkWord, "by")
     let keys = p.fieldNames
-    let kind = p.aggregateKind
-    let aggs = p.fieldNames
-    result = group(keys, aggs, result, kind)
+    var kinds: seq[AggKind] = @[]
+    var aggs: seq[string] = @[]
+    kinds.add(p.aggregateKind)
+    aggs.add(p.want(tkWord).text)
+    while p.current.kind == tkComma:
+      discard p.take
+      # A field named sum/avg/min/max is ambiguous here; treat it as a kind,
+      # matching the existing positional grammar.
+      if p.pos + 1 < p.tokens.len and isAggregateWord(p.tokens[p.pos]) and
+          p.tokens[p.pos + 1].kind == tkWord:
+        kinds.add(p.aggregateKind)
+      else:
+        kinds.add(kinds[^1])
+      aggs.add(p.want(tkWord).text)
+    result = groupKinds(keys, aggs, result, kinds)
   var orderKeys: seq[string] = @[]
   var orderDirs: seq[bool] = @[]
   if p.acceptWord("order"):
@@ -210,6 +225,7 @@ when isMainModule:
   expectShape("select * from t.csv group by Name avg Value", "Group(Name;avg:Value;Scan(Name,Flag,Value))", resolve)
   expectShape("select * from t.csv group by Name min Value", "Group(Name;min:Value;Scan(Name,Flag,Value))", resolve)
   expectShape("select * from t.csv group by Name max Value", "Group(Name;max:Value;Scan(Name,Flag,Value))", resolve)
+  expectShape("select * from t.csv group by Name sum Value, min Value", "Group(Name;sum:Value,min:Value;Scan(Name,Flag,Value))", resolve)
   expectShape("select * from t.csv order by Value desc", "Sort(Value:desc;Scan(Name,Flag,Value))", resolve)
   doAssert runStaged(parseSql("select * from t.csv where Flag='yes'", resolve)) == @["Ada,yes,10", "Ada,yes,7"]
   # Load-bearing: the following assertion fails if the residual Lt branch is
@@ -294,6 +310,19 @@ when isMainModule:
   let mixedString = parseSql("select * from strings.csv group by Name min Value,Flag", resolve)
   doAssert sorted(runStaged(mixedString)) == sorted(directRows(mixedString).mapIt(it.join(",")))
   doAssert sorted(runStaged(mixedString)) == sorted(@["Ada,3,10,10", "Bob,1,13,8"])
+  let mixedKinds = parseSql("select * from t.csv group by Name sum Value, min Value", resolve)
+  doAssert runStaged(mixedKinds) == directRows(mixedKinds).mapIt(it.join(","))
+  doAssert runStaged(mixedKinds) == @["Ada,2,17,7", "Bob,1,20,20"]
+  let mixedIntString = parseSql("select * from strings.csv group by Name sum Value, min Flag", resolve)
+  doAssert runStaged(mixedIntString) == directRows(mixedIntString).mapIt(it.join(","))
+  doAssert runStaged(mixedIntString) == @["Ada,3,33,10", "Bob,1,13,8"]
+  let mixedAvgString = parseSql("select * from strings.csv group by Name avg Value, max Flag", resolve)
+  doAssert runStaged(mixedAvgString) == directRows(mixedAvgString).mapIt(it.join(","))
+  doAssert runStaged(mixedAvgString) == @["Ada,3,11,x", "Bob,1,13,8"]
+  try:
+    discard runStaged(parseSql("select * from strings.csv group by Name sum Flag, min Value", resolve))
+    doAssert false
+  except AssertionDefect: discard
   let orderedString = parseSql("select * from string-order.csv group by Name min Flag order by Name desc", resolve)
   doAssert runStaged(orderedString) == directRows(orderedString).mapIt(it.join(","))
   let multiKey = parseSql("select * from multi.csv group by Dept,Name sum Value", resolve)
