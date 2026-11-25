@@ -139,7 +139,11 @@ proc resultSchema*(q: Operator): seq[string] =
   of okFilter, okPrintCSV: resultSchema(q.parent)
   of okProject: q.outputSchema
   of okJoin, okHashJoin: resultSchema(q.parent) & resultSchema(q.right)
-  of okGroup: q.keys & @["count"] & q.aggregates
+  of okGroup:
+    var aggregateNames: seq[string] = @[]
+    for j, name in q.aggregates:
+      aggregateNames.add(aggName(q.aggKinds[j]) & "_" & name)
+    q.keys & @["count"] & aggregateNames
   of okSort: resultSchema(q.parent)
 
 proc opShape*(q: Operator): string =
