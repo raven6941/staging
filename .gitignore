@@ -18,6 +18,7 @@ nimcache/
 tests/test_vars
 tests/test_while
 tests/test_fun
+tests/test_ackermann
 tests/test_eval
 tests/test_effects
 tests/test_scanner
