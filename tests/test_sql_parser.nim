@@ -1,4 +1,4 @@
-import std/[algorithm, strutils]
+import std/[algorithm, sequtils, strutils]
 import test_query_optc
 
 type
@@ -147,7 +147,6 @@ proc statement(p: var Parser): Operator =
   if p.acceptWord("group"):
     discard p.want(tkWord, "by")
     let keys = p.fieldNames
-    if keys.len != 1: raise newException(ValueError, "multi-key group by is unsupported")
     discard p.want(tkWord, "sum")
     let aggs = p.fieldNames
     result = group(keys, aggs, result)
@@ -163,9 +162,11 @@ proc expectShape(sql, expected: string; resolveTable: proc(ident: string): Opera
 
 when isMainModule:
   let csv = "Name,Flag,Value\nAda,yes,10\nBob,no,20\nAda,yes,7\n"
+  let multiCsv = "Dept,Name,Value\n10,Ada,2\n10,Bob,3\n10,Ada,5\n"
   let gram = "Phrase\tYear\tMatchCount\tVolumeCount\nAuswanderung\t2000\t3\t4\nOther\t2001\t2\t3\n"
   proc resolve(n: string): Operator =
     if n == "?": scan(gram, @["Phrase", "Year", "MatchCount", "VolumeCount"], '\t')
+    elif n == "multi.csv": scan(multiCsv, @["Dept", "Name", "Value"])
     else: scan(csv, @["Name", "Flag", "Value"])
   expectShape("select * from t.csv", "Scan(Name,Flag,Value)", resolve)
   expectShape("select Name from t.csv", "Project(Name;Name;Scan(Name,Flag,Value))", resolve)
@@ -173,6 +174,7 @@ when isMainModule:
   expectShape("select * from nestedloops t.csv join (select Name as Name1 from t.csv)", "Join(Scan(Name,Flag,Value);Project(Name1;Name;Scan(Name,Flag,Value)))", resolve)
   expectShape("select * from t.csv join (select Name from t.csv)", "HashJoin(Scan(Name,Flag,Value);Project(Name;Name;Scan(Name,Flag,Value)))", resolve)
   expectShape("select * from t.csv group by Name sum Value", "Group(Name;Value;Scan(Name,Flag,Value))", resolve)
+  expectShape("select * from t.csv group by Name,Flag sum Value", "Group(Name,Flag;Value;Scan(Name,Flag,Value))", resolve)
   doAssert runStaged(parseSql("select * from t.csv where Flag='yes'", resolve)) == @["Ada,yes,10", "Ada,yes,7"]
   # Load-bearing: the following assertion fails if the residual Lt branch is
   # stubbed out (verified by stubbing it once, observing the failure, restoring).
@@ -198,6 +200,9 @@ when isMainModule:
   doAssert directRows(parseSql("select * from nestedloops t.csv join (select Name as Name1 from t.csv)", resolve)).len == 9
   doAssert directRows(parseSql("select * from t.csv join (select Name from t.csv)", resolve)).len == 5
   doAssert sorted(runStaged(parseSql("select * from t.csv group by Name sum Value", resolve))) == sorted(@["Ada,2,17", "Bob,1,20"])
+  let multiKey = parseSql("select * from multi.csv group by Dept,Name sum Value", resolve)
+  doAssert sorted(runStaged(multiKey)) == sorted(directRows(multiKey).mapIt(it.join(",")))
+  doAssert sorted(runStaged(multiKey)) == sorted(@["10,Ada,2,7", "10,Bob,1,3"])
   doAssert runStaged(parseSql("select * from ? schema Phrase,Year,MatchCount,VolumeCount delim \\t where Phrase='Auswanderung'", resolve)) == @["Auswanderung,2000,3,4"]
   try:
     discard parseSql("select Name t.csv", resolve)
