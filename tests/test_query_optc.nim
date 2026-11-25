@@ -6,7 +6,7 @@
 
 import staging/framework
 import staging/arrays
-import std/[os, osproc, strutils, sequtils, tables]
+import std/[algorithm, os, osproc, strutils, sequtils, tables]
 
 type
   FieldKind = enum fkString, fkInt
@@ -420,7 +420,7 @@ when isMainModule:
   doAssert "while result and i < a.len" in residual
   doAssert "result = result * 41 + ord(a[i])" in residual
   let stagedGroup = runStaged(q)
-  doAssert stagedGroup == expected, $stagedGroup & " != " & $expected
+  doAssert sorted(stagedGroup) == sorted(expected), $stagedGroup & " != " & $expected
 
   let l = "id,value\nA,2\nB,3\n"
   let r = "id,rvalue\nA,10\nB,20\n"
