@@ -66,38 +66,53 @@ proc bufferRead(b: ArrayBuffer; i: Rep[int]; kind: FieldKind): RField =
     RField(kind: kind, str: RString(data: x, len: liftNow(0)))
 
 type
-  RefKind = enum rkField, rkValue
-  Ref = object
+  RefKind* = enum rkField, rkValue
+  Ref* = object
     kind: RefKind
     name: string
     value: RField
-  Predicate = object
+  Predicate* = object
     left, right: Ref
-  OpKind = enum okScan, okFilter, okProject, okJoin, okHashJoin, okGroup, okPrintCSV
-  Operator = ref object
+  OpKind* = enum okScan, okFilter, okProject, okJoin, okHashJoin, okGroup, okPrintCSV
+  Operator* = ref object
     kind: OpKind
     csv, csvRight: string
-    schema, outputSchema, keys, aggregates: seq[string]
+    schema, outputSchema, inputSchema, keys, aggregates: seq[string]
+    delim: char
     predicate: Predicate
     parent, right: Operator
+
+proc directRows*(q: Operator): seq[seq[string]]
+proc execOp*(q: Operator): string
 
 proc staticString(x: string): Rep[string] = liftNow(x)
 proc staticInt(x: int): Rep[int] = liftNow(x)
 proc staticField(x: string): RField = RField(kind: fkString, str: RString(data: staticString(x), len: staticInt(x.len)))
 proc intField(x: int): RField = RField(kind: fkInt, int: RInt(value: staticInt(x)))
-proc field(name: string): Ref = Ref(kind: rkField, name: name)
-proc value(x: string): Ref = Ref(kind: rkValue, value: staticField(x))
-proc intValue(x: int): Ref = Ref(kind: rkValue, value: intField(x))
-proc scan(csv: string; schema: seq[string]): Operator = Operator(kind: okScan, csv: csv, schema: schema)
-proc filter(p: Predicate; q: Operator): Operator = Operator(kind: okFilter, predicate: p, parent: q)
-proc project(s: seq[string]; q: Operator): Operator = Operator(kind: okProject, outputSchema: s, parent: q)
-proc join(a, b: Operator): Operator = Operator(kind: okJoin, parent: a, right: b)
-proc hashJoin(a, b: Operator): Operator = Operator(kind: okHashJoin, parent: a, right: b)
-proc group(keys, aggs: seq[string]; q: Operator): Operator = Operator(kind: okGroup, keys: keys, aggregates: aggs, parent: q)
+proc field*(name: string): Ref = Ref(kind: rkField, name: name)
+proc value*(x: string): Ref = Ref(kind: rkValue, value: staticField(x))
+proc intValue*(x: int): Ref = Ref(kind: rkValue, value: intField(x))
+proc scan*(csv: string; schema: seq[string]; delim = ','): Operator =
+  let header = csv.splitLines[0].split(delim)
+  doAssert header.len == schema.len, "schema length does not match CSV header"
+  Operator(kind: okScan, csv: csv, schema: schema, delim: delim)
+proc setSchema*(q: Operator; schema: seq[string]): Operator =
+  q.schema = schema
+  q
+proc setDelim*(q: Operator; delim: char): Operator =
+  q.delim = delim
+  q
+proc filter*(p: Predicate; q: Operator): Operator = Operator(kind: okFilter, csv: q.csv, delim: q.delim, predicate: p, parent: q)
+proc project*(s: seq[string]; q: Operator; inputSchema: seq[string] = @[]): Operator =
+  Operator(kind: okProject, csv: q.csv, delim: q.delim, outputSchema: s,
+    inputSchema: (if inputSchema.len == 0: s else: inputSchema), parent: q)
+proc join*(a, b: Operator): Operator = Operator(kind: okJoin, parent: a, right: b)
+proc hashJoin*(a, b: Operator): Operator = Operator(kind: okHashJoin, parent: a, right: b)
+proc group*(keys, aggs: seq[string]; q: Operator): Operator = Operator(kind: okGroup, keys: keys, aggregates: aggs, parent: q)
 proc printCSV(q: Operator): Operator = Operator(kind: okPrintCSV, parent: q)
-proc equals(a, b: Ref): Predicate = Predicate(left: a, right: b)
+proc equals*(a, b: Ref): Predicate = Predicate(left: a, right: b)
 
-proc resultSchema(q: Operator): seq[string] =
+proc resultSchema*(q: Operator): seq[string] =
   case q.kind
   of okScan: q.schema
   of okFilter, okPrintCSV: resultSchema(q.parent)
@@ -105,25 +120,60 @@ proc resultSchema(q: Operator): seq[string] =
   of okJoin, okHashJoin: resultSchema(q.parent) & resultSchema(q.right)
   of okGroup: q.keys & @["count"] & q.aggregates
 
+proc opShape*(q: Operator): string =
+  ## A compact structural view used by the SQL front-end tests.
+  case q.kind
+  of okScan: "Scan(" & q.schema.join(",") & ")"
+  of okFilter: "Filter(" & opShape(q.parent) & ")"
+  of okProject: "Project(" & q.outputSchema.join(",") & ";" & q.inputSchema.join(",") & ";" & opShape(q.parent) & ")"
+  of okJoin: "Join(" & opShape(q.parent) & ";" & opShape(q.right) & ")"
+  of okHashJoin: "HashJoin(" & opShape(q.parent) & ";" & opShape(q.right) & ")"
+  of okGroup: "Group(" & q.keys.join(",") & ";" & q.aggregates.join(",") & ";" & opShape(q.parent) & ")"
+  of okPrintCSV: "Print(" & opShape(q.parent) & ")"
+
 proc lookup(s: seq[string]; n: string): int =
   result = s.find(n); doAssert result >= 0, "unknown field " & n
 
-proc parseRows(csv: string): seq[seq[string]] =
+proc parseRows*(csv: string; delim = ','): seq[seq[string]] =
   for line in csv.strip.splitLines[1 .. ^1]:
-    if line.len > 0: result.add(line.split(','))
+    if line.len > 0: result.add(line.split(delim))
+
+proc refText(r: Ref; row: seq[string]; schema: seq[string]): string =
+  if r.kind == rkField: row[lookup(schema, r.name)]
+  elif r.value.kind == fkString: r.value.str.data.staticVal
+  else: $r.value.int.value.staticVal
+
+proc refKind(r: Ref; schema: seq[string]; kinds: seq[bool]): FieldKind =
+  if r.kind == rkField:
+    if kinds[lookup(schema, r.name)]: fkString else: fkInt
+  else: r.value.kind
+
+proc columnKinds(q: Operator): seq[bool] =
+  let schema = resultSchema(q)
+  let rows = directRows(q)
+  if rows.len == 0: return newSeq[bool](schema.len)
+  for cell in rows[0]:
+    try: discard parseInt(cell); result.add(false)
+    except ValueError: result.add(true)
 
 proc directRows(q: Operator): seq[seq[string]] =
   case q.kind
-  of okScan: result = parseRows(q.csv)
+  of okScan: result = parseRows(q.csv, q.delim)
   of okFilter:
     let ps = resultSchema(q.parent)
+    let kinds = columnKinds(q.parent)
     for row in directRows(q.parent):
-      let a = if q.predicate.left.kind == rkField: row[lookup(ps, q.predicate.left.name)] else: q.predicate.left.value.str.data.staticVal
-      let b = if q.predicate.right.kind == rkField: row[lookup(ps, q.predicate.right.name)] else: q.predicate.right.value.str.data.staticVal
-      if a == b: result.add(row)
+        let aKind = refKind(q.predicate.left, ps, kinds)
+        let bKind = refKind(q.predicate.right, ps, kinds)
+        doAssert aKind == bKind, "predicate kind mismatch"
+        if refText(q.predicate.left, row, ps) == refText(q.predicate.right, row, ps): result.add(row)
   of okProject:
     let ps = resultSchema(q.parent)
-    for row in directRows(q.parent): result.add(q.outputSchema.mapIt(row[lookup(ps, it)]))
+    let ins = if q.inputSchema.len == 0: q.outputSchema else: q.inputSchema
+    for row in directRows(q.parent):
+      var projected: seq[string] = @[]
+      for name in ins: projected.add(row[lookup(ps, name)])
+      result.add(projected)
   of okJoin, okHashJoin:
     let ls = resultSchema(q.parent); let rs = resultSchema(q.right)
     for a in directRows(q.parent):
@@ -270,21 +320,22 @@ proc execOp(q: Operator): string =
   proc andB(a,b: Rep[bool]): Rep[bool] = dynamic[bool](QueryNode(kind:nkAnd,boolA:a,boolB:b))
   proc pr(xs: seq[RField]): Rep[Unit] = dynamic[Unit](QueryNode(kind:nkPrint,fields:xs))
   proc addMany(xs: seq[Rep[Unit]]): Rep[Unit] = seqMany(xs)
-  proc firstData(csv: string; col: int): string = csv.strip.splitLines[1].split(',')[col]
+  proc firstData(csv: string; col: int; delim: char): string = csv.strip.splitLines[1].split(delim)[col]
   proc stringCols(csv: string; schema: seq[string]): seq[bool] =
+    let delim = if q.kind == okScan: q.delim else: q.parent.delim
     for i in 0 ..< schema.len:
-      try: discard parseInt(firstData(csv, i)); result.add(false)
+      try: discard parseInt(firstData(csv, i, delim)); result.add(false)
       except ValueError: result.add(true)
-  proc row(sc: Scanner; csv: string; schema: seq[string]; kinds: seq[bool]): seq[RField] =
+  proc row(sc: Scanner; csv: string; schema: seq[string]; kinds: seq[bool]; delim: char): seq[RField] =
     for i in 0 ..< schema.len:
-      let d = if i == schema.high: '\n' else: ','
+      let d = if i == schema.high: '\n' else: delim
       if kinds[i]: result.add(RField(kind:fkString,str:RString(data:scannerNext(sc,d))))
       else: result.add(RField(kind:fkInt,int:RInt(value:scannerNextInt(sc,d))))
-  proc scanRows(csv: string; schema: seq[string]; kinds: seq[bool]; emitRow: proc(f: seq[RField]): Rep[Unit]): Rep[Unit] =
+  proc scanRows(csv: string; schema: seq[string]; kinds: seq[bool]; delim: char; emitRow: proc(f: seq[RField]): Rep[Unit]): Rep[Unit] =
     let sc = scannerNew(csv)
     vars.add(sc.pos)
     let start = vw(sc.pos, staticInt(csv.find('\n') + 1))
-    let loop = whileLoop(proc():Rep[bool]=scannerHasNext(sc), proc():Rep[Unit]=emitRow(row(sc,csv,schema,kinds)))
+    let loop = whileLoop(proc():Rep[bool]=scannerHasNext(sc), proc():Rep[Unit]=emitRow(row(sc,csv,schema,kinds,delim)))
     seqs(start, loop)
   proc keyNames(a,b: seq[string]): seq[string] =
     for x in a:
@@ -361,7 +412,7 @@ proc execOp(q: Operator): string =
           for j,n in q.aggregates: xs.add(aw(outSum,intAdd(intMul(vr(used),staticInt(q.aggregates.len)),staticInt(j)),ar(inputAgg[j],vr(inputPos))))
           xs.add(vw(used,intAdd(vr(used),staticInt(1)))); addMany(xs))
       updates.add(update); updates.add(vw(inputPos,intAdd(vr(inputPos),staticInt(1)))); addMany(updates)
-    let consumeAll = scanRows(q.parent.csv, schema, stringKinds, consume)
+    let consumeAll = scanRows(q.parent.csv, schema, stringKinds, q.parent.delim, consume)
     var output: seq[Rep[Unit]] = @[]
     let outLoop = whileLoop(proc():Rep[bool]=ltI(vr(outPos),vr(used)), proc():Rep[Unit]=
       var fs: seq[RField] = @[]
@@ -396,7 +447,7 @@ proc execOp(q: Operator): string =
       result = fieldHash(fs[lookup(schema,keys[0])].str)
       for k in keys[1 .. ^1]: result = intMod(intAdd(result,fieldHash(fs[lookup(schema,k)].str)),staticInt(cap))
       result = intMod(result,staticInt(cap))
-    let build = scanRows(q.parent.csv,ls,lk,proc(f: seq[RField]):Rep[Unit]=
+    let build = scanRows(q.parent.csv,ls,lk,q.parent.delim,proc(f: seq[RField]):Rep[Unit]=
       var stableWrites: seq[Rep[Unit]] = @[]; var sf: seq[RField] = @[]
       for j in 0 ..< ls.len:
         if lk[j]: stableWrites.add(sw(leftTmpS[j],vr(leftTmpPos),f[j].str.data)); sf.add(RField(kind:fkString,str:RString(data:sr(leftTmpS[j],vr(leftTmpPos)))))
@@ -410,7 +461,7 @@ proc execOp(q: Operator): string =
         else: xs.add(aw(hrowsI[j],vr(pos),fld.int.value))
       xs.add(vw(used,intAdd(vr(used),staticInt(1)))); xs.add(vw(leftTmpPos,intAdd(vr(leftTmpPos),staticInt(1)))); addMany(xs))
     let probe = seqs(vw(rscan.pos,staticInt(q.right.csv.find('\n')+1)),whileLoop(proc():Rep[bool]=scannerHasNext(rscan),proc():Rep[Unit]=
-      let f=row(rscan,q.right.csv,rs,rk); var stableWrites: seq[Rep[Unit]] = @[]; var sf: seq[RField] = @[]
+      let f=row(rscan,q.right.csv,rs,rk,q.right.delim); var stableWrites: seq[Rep[Unit]] = @[]; var sf: seq[RField] = @[]
       for j in 0 ..< rs.len:
         if rk[j]: stableWrites.add(sw(rightTmpS[j],vr(rightTmpPos),f[j].str.data)); sf.add(RField(kind:fkString,str:RString(data:sr(rightTmpS[j],vr(rightTmpPos)))))
         else: stableWrites.add(aw(rightTmpI[j],vr(rightTmpPos),f[j].int.value)); sf.add(RField(kind:fkInt,int:RInt(value:ar(rightTmpI[j],vr(rightTmpPos)))))
@@ -423,18 +474,79 @@ proc execOp(q: Operator): string =
         outputFields.add(sf); seqs(ifB(same,proc():Rep[Unit]=pr(outputFields),proc():Rep[Unit]=unit()),vw(pos,intMod(intAdd(vr(pos),staticInt(1)),staticInt(cap)))))
       seqs(addMany(xs),seqs(loop,vw(rightTmpPos,intAdd(vr(rightTmpPos),staticInt(1)))))))
     body=seqs(build,probe)
+  elif q.kind == okFilter:
+    let schema = resultSchema(q.parent)
+    let kinds = stringCols(q.parent.csv, schema)
+    let leftKind = if q.predicate.left.kind == rkField: (if kinds[lookup(schema,q.predicate.left.name)]: fkString else: fkInt) else: q.predicate.left.value.kind
+    let rightKind = if q.predicate.right.kind == rkField: (if kinds[lookup(schema,q.predicate.right.name)]: fkString else: fkInt) else: q.predicate.right.value.kind
+    doAssert leftKind == rightKind, "predicate kind mismatch"
+    let pos = iv("filterPos")
+    var bs: seq[Arr[string]] = @[]
+    var bi: seq[Arr[int]] = @[]
+    for i in 0 ..< schema.len:
+      if kinds[i]: bs.add(sa("filterS" & $i))
+      else: bi.add(ia("filterI" & $i))
+    body = scanRows(q.parent.csv, schema, kinds, q.parent.delim, proc(f: seq[RField]): Rep[Unit] =
+      var writes: seq[Rep[Unit]] = @[]; var si = 0; var ii = 0
+      for i in 0 ..< schema.len:
+        if kinds[i]: writes.add(sw(bs[si], vr(pos), f[i].str.data)); inc si
+        else: writes.add(aw(bi[ii], vr(pos), f[i].int.value)); inc ii
+      var loaded: seq[RField] = @[]; si = 0; ii = 0
+      for i in 0 ..< schema.len:
+        if kinds[i]: loaded.add(RField(kind: fkString, str: RString(data: sr(bs[si], vr(pos))))); inc si
+        else: loaded.add(RField(kind: fkInt, int: RInt(value: ar(bi[ii], vr(pos))))); inc ii
+      var a, b: RField
+      if q.predicate.left.kind == rkField: a = loaded[lookup(schema,q.predicate.left.name)] else: a = q.predicate.left.value
+      if q.predicate.right.kind == rkField: b = loaded[lookup(schema,q.predicate.right.name)] else: b = q.predicate.right.value
+      let same = if leftKind == fkString: stringCompare(a.str,b.str) else: eqI(a.int.value,b.int.value)
+      seqs(addMany(writes), seqs(ifB(same, proc():Rep[Unit]=pr(loaded), proc():Rep[Unit]=unit()), vw(pos, intAdd(vr(pos), staticInt(1))))))
+  elif q.kind == okProject:
+    let source = if q.parent.kind == okFilter: q.parent.parent else: q.parent
+    let schema = resultSchema(source)
+    let kinds = stringCols(source.csv, schema)
+    let input = if q.inputSchema.len == 0: q.outputSchema else: q.inputSchema
+    let emit = proc(f: seq[RField]): Rep[Unit] =
+      var selected: seq[RField] = @[]
+      for name in input: selected.add(f[lookup(schema,name)])
+      pr(selected)
+    if q.parent.kind == okFilter:
+      let pred = q.parent.predicate
+      let leftKind = if pred.left.kind == rkField: (if kinds[lookup(schema,pred.left.name)]: fkString else: fkInt) else: pred.left.value.kind
+      let rightKind = if pred.right.kind == rkField: (if kinds[lookup(schema,pred.right.name)]: fkString else: fkInt) else: pred.right.value.kind
+      doAssert leftKind == rightKind, "predicate kind mismatch"
+      body = scanRows(source.csv, schema, kinds, source.delim, proc(f: seq[RField]): Rep[Unit] =
+        var a, b: RField
+        if pred.left.kind == rkField: a = f[lookup(schema,pred.left.name)] else: a = pred.left.value
+        if pred.right.kind == rkField: b = f[lookup(schema,pred.right.name)] else: b = pred.right.value
+        let same = if leftKind == fkString: stringCompare(a.str,b.str) else: eqI(a.int.value,b.int.value)
+        ifB(same, proc(): Rep[Unit] = emit(f), proc(): Rep[Unit] = unit()))
+    else:
+      body = scanRows(source.csv, schema, kinds, source.delim, emit)
+  elif q.kind == okJoin:
+    let ls = resultSchema(q.parent); let rs = resultSchema(q.right)
+    let lk = stringCols(q.parent.csv, ls); let rk = stringCols(q.right.csv, rs)
+    body = scanRows(q.parent.csv, ls, lk, q.parent.delim, proc(left: seq[RField]): Rep[Unit] =
+      scanRows(q.right.csv, rs, rk, q.right.delim, proc(right: seq[RField]): Rep[Unit] =
+        var same: Rep[bool] = liftNow(true)
+        for name in ls:
+          if name in rs:
+            let li = lookup(ls,name); let ri = lookup(rs,name)
+            doAssert left[li].kind == right[ri].kind, "join kind mismatch"
+            let eq = if left[li].kind == fkString: stringCompare(left[li].str,right[ri].str) else: eqI(left[li].int.value,right[ri].int.value)
+            same = andB(same,eq)
+        ifB(same, proc():Rep[Unit]=pr(left & right), proc():Rep[Unit]=unit())))
   else:
     let schema = resultSchema(if q.kind == okScan: q else: q.parent)
     let csv = if q.kind == okScan: q.csv else: q.parent.csv
     let kinds=stringCols(csv,schema)
-    body=scanRows(csv,schema,kinds,proc(f: seq[RField]):Rep[Unit]=pr(f))
+    body=scanRows(csv,schema,kinds,if q.kind == okScan: q.delim else: q.parent.delim,proc(f: seq[RField]):Rep[Unit]=pr(f))
   result = "import std/strutils\n\nproc compareStringChars(a,b: string): bool =\n  var i = 0\n  result = a.len == b.len\n  while result and i < a.len:\n    result = a[i] == b[i]\n    inc i\n\nproc hashString(a: string): int =\n  var i = 0\n  result = 0\n  while i < a.len:\n    result = result * 41 + ord(a[i])\n    inc i\n\nproc scannerNext(text: string; pos: var int; delim: char): string =\n  let start = pos\n  var stop = pos\n  while stop < text.len and text[stop] != delim: inc stop\n  result = text[start ..< stop]\n  if stop < text.len: inc stop\n  pos = stop\n\n"
   for a in strings: result.add(emitDecl(a) & "\n")
   for a in ints: result.add(emitDecl(a) & "\n")
   for v in vars: result.add(emitDecl(v) & "\n")
   result.add(emitStmt(body) & "\n")
 
-proc runStaged(q: Operator): seq[string] =
+proc runStaged*(q: Operator): seq[string] =
   let d = getTempDir()/("query-optc-" & $getCurrentProcessId()); createDir(d)
   let src=d/"residual.nim"; writeFile(src, execOp(q)); let outputText=compileRun(src,d/"residual",d)
   if outputText.len > 0: result=outputText.splitLines

@@ -57,3 +57,4 @@ task test, "Run the self-tests":
   exec "nim c -r --hints:off --path:src tests/test_effects.nim"
   exec "nim c -r --hints:off --path:src tests/test_scanner.nim"
   exec "nim c -r --hints:off --path:src tests/test_query_optc.nim"
+  exec "nim c -r --hints:off --path:src tests/test_sql_parser.nim"
