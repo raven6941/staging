@@ -219,7 +219,8 @@ proc directRows(q: Operator): seq[seq[string]] =
           if k in rs: good = good and a[lookup(ls, k)] == b[lookup(rs, k)]
         if good: result.add(a & b)
   of okGroup:
-    let ps = resultSchema(q.parent); var groups = initTable[string, seq[string]]()
+    let ps = resultSchema(q.parent); let kinds = columnKinds(q.parent)
+    var groups = initTable[string, seq[string]]()
     for row in directRows(q.parent):
       let k = q.keys.mapIt(row[lookup(ps, it)]).join("\x1f")
       if not groups.hasKey(k): groups[k] = q.keys.mapIt(row[lookup(ps, it)]) & @[$1] & q.aggregates.mapIt(row[lookup(ps, it)])
@@ -228,12 +229,23 @@ proc directRows(q: Operator): seq[seq[string]] =
         groups[k][countIndex] = $(parseInt(groups[k][countIndex]) + 1)
         for j, n in q.aggregates:
           let valueIndex = countIndex + 1 + j
-          let value = parseInt(row[lookup(ps, n)])
-          let current = parseInt(groups[k][valueIndex])
-          case q.aggKind
-          of akSum, akAvg: groups[k][valueIndex] = $(current + value)
-          of akMin: groups[k][valueIndex] = $(min(current, value))
-          of akMax: groups[k][valueIndex] = $(max(current, value))
+          let aggregateIndex = lookup(ps, n)
+          if kinds[aggregateIndex]:
+            let value = row[aggregateIndex]
+            let current = groups[k][valueIndex]
+            case q.aggKind
+            of akMin:
+              if value < current: groups[k][valueIndex] = value
+            of akMax:
+              if current < value: groups[k][valueIndex] = value
+            of akSum, akAvg: doAssert false, "aggregate field must be integer"
+          else:
+            let value = parseInt(row[aggregateIndex])
+            let current = parseInt(groups[k][valueIndex])
+            case q.aggKind
+            of akSum, akAvg: groups[k][valueIndex] = $(current + value)
+            of akMin: groups[k][valueIndex] = $(min(current, value))
+            of akMax: groups[k][valueIndex] = $(max(current, value))
     for x in groups.mvalues:
       if q.aggKind == akAvg:
         let count = parseInt(x[q.keys.len])
@@ -381,8 +393,8 @@ proc execOpWith(q: Operator; emitRow: proc(f: seq[RField]): Rep[Unit];
   var strings = sharedStrings
   proc iv(name: string; x = 0): Var[int] =
     result = newVar(staticInt(x), proc(v: Rep[int]): IRNode = QueryNode(kind:nkVarDecl,name:name,init:v)); vars.add(result)
-  proc ia(name: string): Arr[int] =
-    result = newArray[int](staticInt(cap), proc(v: Rep[int]): IRNode = QueryNode(kind:nkArrDecl,name:name,init:v)); ints.add(result)
+  proc ia(name: string; size = cap): Arr[int] =
+    result = newArray[int](staticInt(size), proc(v: Rep[int]): IRNode = QueryNode(kind:nkArrDecl,name:name,init:v)); ints.add(result)
   proc sa(name: string): Arr[string] =
     result = newArray[string](staticInt(cap), proc(v: Rep[int]): IRNode = QueryNode(kind:nkArrDecl,name:name,init:v)); strings.add(result)
   proc vr(v: Var[int]): Rep[int] = readVar(v, proc(x: Var[int]): IRNode = QueryNode(kind:nkVarRead,v:x))
@@ -507,7 +519,9 @@ proc execOpWith(q: Operator; emitRow: proc(f: seq[RField]): Rep[Unit];
       else:
         keyBufS.add(nil); keyBufI.add(ia(if j == 0: "groupKeyInts" else: "groupKeyI" & $j))
         outKeyS.add(nil); outKeyI.add(ia(if j == 0: "outKeyInts" else: "outKeyI" & $j))
-    let outCount=ia("outCounts"); let outAgg=ia("outAggs")
+    let outCount=ia("outCounts"); let outAgg=ia("outAggs", cap * q.aggregates.len)
+    var outAggS: seq[Arr[string]] = @[]
+    for k in 0 ..< q.aggregates.len: outAggS.add(sa("outAggS" & $k))
     var inputColsS: seq[Arr[string]] = @[]
     var inputColsI: seq[Arr[int]] = @[]
     for i in 0 ..< schema.len:
@@ -515,6 +529,10 @@ proc execOpWith(q: Operator; emitRow: proc(f: seq[RField]): Rep[Unit];
       else: inputColsI.add(ia("inputColI" & $i))
     var inputAgg: seq[Arr[int]] = @[]
     for k in 0 ..< q.aggregates.len: inputAgg.add(ia("inputAgg" & $k))
+    var inputAggS: seq[Arr[string]] = @[]
+    for k in 0 ..< q.aggregates.len: inputAggS.add(sa("inputAggS" & $k))
+    var aggIsString: seq[bool] = @[]
+    for n in q.aggregates: aggIsString.add(stringKinds[lookup(schema, n)])
     let inputPos=iv("inputPos")
     proc consume(f: seq[RField]): Rep[Unit] =
       var inputWrites: seq[Rep[Unit]] = @[]
@@ -527,11 +545,14 @@ proc execOpWith(q: Operator; emitRow: proc(f: seq[RField]): Rep[Unit];
           inputWrites.add(aw(inputColsI[iCol],vr(inputPos),f[i].int.value)); inc iCol
       for j,n in q.aggregates:
         let aggregateIndex = lookup(schema,n)
-        doAssert not stringKinds[aggregateIndex], "aggregate field must be integer"
         var aggregateStorageIndex = 0
         for i in 0 ..< aggregateIndex:
-          if not stringKinds[i]: inc aggregateStorageIndex
-        inputWrites.add(aw(inputAgg[j],vr(inputPos),ar(inputColsI[aggregateStorageIndex],vr(inputPos))))
+          if stringKinds[i] == aggIsString[j]: inc aggregateStorageIndex
+        if aggIsString[j]:
+          inputWrites.add(sw(inputAggS[j],vr(inputPos),sr(inputColsS[aggregateStorageIndex],vr(inputPos))))
+        else:
+          doAssert not stringKinds[aggregateIndex], "aggregate field must be integer"
+          inputWrites.add(aw(inputAgg[j],vr(inputPos),ar(inputColsI[aggregateStorageIndex],vr(inputPos))))
       var storedKeys: seq[RField] = @[]
       var h: Rep[int] = staticInt(0)
       for j, keyIndex in keyIndexes:
@@ -571,20 +592,29 @@ proc execOpWith(q: Operator; emitRow: proc(f: seq[RField]): Rep[Unit];
         proc():Rep[Unit]=
           let compact = ar(slotIndex,vr(pos)); var xs: seq[Rep[Unit]] = @[aw(outCount,compact,intAdd(ar(outCount,compact),staticInt(1)))]
           for j,n in q.aggregates:
-            let aggregateIndex = intAdd(intMul(compact,staticInt(q.aggregates.len)),staticInt(j))
-            let current = ar(outAgg, aggregateIndex)
-            let incoming = ar(inputAgg[j],vr(inputPos))
-            case q.aggKind
-            of akSum, akAvg: xs.add(aw(outAgg,aggregateIndex,intAdd(current,incoming)))
-            of akMin: xs.add(ifB(ltI(incoming,current), proc():Rep[Unit]=aw(outAgg,aggregateIndex,incoming), proc():Rep[Unit]=unit()))
-            of akMax: xs.add(ifB(ltI(current,incoming), proc():Rep[Unit]=aw(outAgg,aggregateIndex,incoming), proc():Rep[Unit]=unit()))
+            if aggIsString[j]:
+              let current = sr(outAggS[j], compact); let incoming = sr(inputAggS[j],vr(inputPos))
+              case q.aggKind
+              of akMin: xs.add(ifB(stringLess(RString(data:incoming),RString(data:current)), proc():Rep[Unit]=sw(outAggS[j],compact,incoming), proc():Rep[Unit]=unit()))
+              of akMax: xs.add(ifB(stringLess(RString(data:current),RString(data:incoming)), proc():Rep[Unit]=sw(outAggS[j],compact,incoming), proc():Rep[Unit]=unit()))
+              of akSum, akAvg: doAssert false, "aggregate field must be integer"
+            else:
+              let aggregateIndex = intAdd(intMul(compact,staticInt(q.aggregates.len)),staticInt(j))
+              let current = ar(outAgg, aggregateIndex)
+              let incoming = ar(inputAgg[j],vr(inputPos))
+              case q.aggKind
+              of akSum, akAvg: xs.add(aw(outAgg,aggregateIndex,intAdd(current,incoming)))
+              of akMin: xs.add(ifB(ltI(incoming,current), proc():Rep[Unit]=aw(outAgg,aggregateIndex,incoming), proc():Rep[Unit]=unit()))
+              of akMax: xs.add(ifB(ltI(current,incoming), proc():Rep[Unit]=aw(outAgg,aggregateIndex,incoming), proc():Rep[Unit]=unit()))
           addMany(xs),
         proc():Rep[Unit]=
           var xs: seq[Rep[Unit]] = @[aw(slotIndex,vr(pos),vr(used)), aw(outCount,vr(used),staticInt(1))]
           for j, key in storedKeys:
             if key.kind == fkString: xs.add(sw(outKeyS[j],vr(used),key.str.data))
             else: xs.add(aw(outKeyI[j],vr(used),key.int.value))
-          for j,n in q.aggregates: xs.add(aw(outAgg,intAdd(intMul(vr(used),staticInt(q.aggregates.len)),staticInt(j)),ar(inputAgg[j],vr(inputPos))))
+          for j,n in q.aggregates:
+            if aggIsString[j]: xs.add(sw(outAggS[j],vr(used),sr(inputAggS[j],vr(inputPos))))
+            else: xs.add(aw(outAgg,intAdd(intMul(vr(used),staticInt(q.aggregates.len)),staticInt(j)),ar(inputAgg[j],vr(inputPos))))
           xs.add(vw(used,intAdd(vr(used),staticInt(1)))); addMany(xs))
       updates.add(update); updates.add(vw(inputPos,intAdd(vr(inputPos),staticInt(1)))); addMany(updates)
     let consumeAll = scanRows(q.parent.csv, schema, stringKinds, q.parent.delim, consume)
@@ -598,9 +628,12 @@ proc execOpWith(q: Operator; emitRow: proc(f: seq[RField]): Rep[Unit];
           fs.add(RField(kind:fkInt,int:RInt(value:ar(outKeyI[j],vr(outPos)))))
       fs.add(RField(kind:fkInt,int:RInt(value:ar(outCount,vr(outPos)))))
       for j in 0 ..< q.aggregates.len:
-        let aggregate = ar(outAgg,intAdd(intMul(vr(outPos),staticInt(q.aggregates.len)),staticInt(j)))
-        let value = if q.aggKind == akAvg: intDiv(aggregate, ar(outCount,vr(outPos))) else: aggregate
-        fs.add(RField(kind:fkInt,int:RInt(value:value)))
+        if aggIsString[j]:
+          fs.add(RField(kind:fkString,str:RString(data:sr(outAggS[j],vr(outPos)))))
+        else:
+          let aggregate = ar(outAgg,intAdd(intMul(vr(outPos),staticInt(q.aggregates.len)),staticInt(j)))
+          let value = if q.aggKind == akAvg: intDiv(aggregate, ar(outCount,vr(outPos))) else: aggregate
+          fs.add(RField(kind:fkInt,int:RInt(value:value)))
       seqs(emitRow(fs),vw(outPos,intAdd(vr(outPos),staticInt(1)))))
     body = seqs(consumeAll,outLoop)
   elif q.kind == okHashJoin:
@@ -792,6 +825,11 @@ when isMainModule:
   let reverseMaxGroup = group(@["name"], @["amount"], scan(reverseMaxCsv,@["name","amount"]), akMax)
   doAssert runStaged(reverseMaxGroup) == directRows(reverseMaxGroup).mapIt(it.join(","))
   doAssert runStaged(reverseMaxGroup) == @["Ada,2,10"]
+
+  var manyGroups = "name,a,b\n"
+  for i in 0 ..< 40: manyGroups.add("G" & $i & "," & $(i + 1) & "," & $(i + 2) & "\n")
+  let manyAggs = group(@["name"], @["a", "b"], scan(manyGroups, @["name", "a", "b"]))
+  doAssert sorted(runStaged(manyAggs)) == sorted(directRows(manyAggs).mapIt(it.join(",")))
 
   let nonKeyStringCsv = "name,dept,amount\nAda,10,2\nBob,20,3\nAda,30,5\n"
   let nonKeyStringGroup = group(@["name"], @["amount"], scan(nonKeyStringCsv,@["name","dept","amount"]))

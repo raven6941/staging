@@ -186,11 +186,15 @@ proc expectShape(sql, expected: string; resolveTable: proc(ident: string): Opera
 
 when isMainModule:
   let csv = "Name,Flag,Value\nAda,yes,10\nBob,no,20\nAda,yes,7\n"
+  let stringAggCsv = "Name,Flag,Value\nAda,x,10\nAda,10,11\nAda,9,12\nBob,8,13\n"
+  let stringOrderCsv = "Name,Flag,Value\nAda,x,10\nAda,y,11\nBob,z,12\n"
   let multiCsv = "Dept,Name,Value\n10,Ada,2\n10,Bob,3\n10,Ada,5\n"
   let gram = "Phrase\tYear\tMatchCount\tVolumeCount\nAuswanderung\t2000\t3\t4\nOther\t2001\t2\t3\n"
   proc resolve(n: string): Operator =
     if n == "?": scan(gram, @["Phrase", "Year", "MatchCount", "VolumeCount"], '\t')
     elif n == "multi.csv": scan(multiCsv, @["Dept", "Name", "Value"])
+    elif n == "strings.csv": scan(stringAggCsv, @["Name", "Flag", "Value"])
+    elif n == "string-order.csv": scan(stringOrderCsv, @["Name", "Flag", "Value"])
     else: scan(csv, @["Name", "Flag", "Value"])
   expectShape("select * from t.csv", "Scan(Name,Flag,Value)", resolve)
   expectShape("select Name from t.csv", "Project(Name;Name;Scan(Name,Flag,Value))", resolve)
@@ -248,6 +252,21 @@ when isMainModule:
     discard runStaged(parseSql("select * from t.csv group by Name sum Flag", resolve))
     doAssert false
   except AssertionDefect: discard
+  try:
+    discard runStaged(parseSql("select * from t.csv group by Name avg Flag", resolve))
+    doAssert false
+  except AssertionDefect: discard
+  for kind in [akMin, akMax]:
+    let grouped = parseSql("select * from strings.csv group by Name " & aggName(kind) & " Flag", resolve)
+    doAssert sorted(runStaged(grouped)) == sorted(directRows(grouped).mapIt(it.join(",")))
+    let expected = if kind == akMin: @[
+      "Ada,3,10", "Bob,1,8"] else: @["Ada,3,x", "Bob,1,8"]
+    doAssert sorted(runStaged(grouped)) == sorted(expected)
+  let mixedString = parseSql("select * from strings.csv group by Name min Value,Flag", resolve)
+  doAssert sorted(runStaged(mixedString)) == sorted(directRows(mixedString).mapIt(it.join(",")))
+  doAssert sorted(runStaged(mixedString)) == sorted(@["Ada,3,10,10", "Bob,1,13,8"])
+  let orderedString = parseSql("select * from string-order.csv group by Name min Flag order by Name desc", resolve)
+  doAssert runStaged(orderedString) == directRows(orderedString).mapIt(it.join(","))
   let multiKey = parseSql("select * from multi.csv group by Dept,Name sum Value", resolve)
   doAssert sorted(runStaged(multiKey)) == sorted(directRows(multiKey).mapIt(it.join(",")))
   doAssert sorted(runStaged(multiKey)) == sorted(@["10,Ada,2,7", "10,Bob,1,3"])
