@@ -190,7 +190,18 @@ proc statement(p: var Parser): Operator =
       discard p.take
   if outNames.len > 0: result = project(outNames, result, inNames)
   if orderKeys.len > 0: result = orderBy(orderKeys, orderDirs, result)
-  if p.acceptWord("limit"): result = limit(parseInt(p.want(tkInt).text), result)
+  var limitN = -1
+  var offsetM = 0
+  var hasOffset = false
+  if p.acceptWord("limit"):
+    limitN = parseInt(p.want(tkInt).text)
+    if p.acceptWord("offset"):
+      offsetM = parseInt(p.want(tkInt).text)
+      hasOffset = true
+    if hasOffset: result = offset(offsetM, result)
+    if limitN >= 0: result = limit(limitN, result)
+  elif p.acceptWord("offset"):
+    result = offset(parseInt(p.want(tkInt).text), result)
 
 proc parseSql*(sql: string; resolveTable: proc(ident: string): Operator): Operator =
   var p = Parser(input: sql, tokens: tokenize(sql), resolveTable: resolveTable)
@@ -229,10 +240,23 @@ when isMainModule:
   expectShape("select * from t.csv group by Name sum Value, min Value", "Group(Name;sum:Value,min:Value;Scan(Name,Flag,Value))", resolve)
   expectShape("select * from t.csv order by Value desc", "Sort(Value:desc;Scan(Name,Flag,Value))", resolve)
   expectShape("select * from t.csv limit 2", "Limit(2;Scan(Name,Flag,Value))", resolve)
+  expectShape("select * from t.csv limit 2 offset 1", "Limit(2;Offset(1;Scan(Name,Flag,Value)))", resolve)
   let limited = parseSql("select * from t.csv limit 2", resolve)
   doAssert "limitCount" in execOp(limited)
   doAssert runStaged(limited) == directRows(limited).mapIt(it.join(","))
   doAssert runStaged(limited) == @["Ada,yes,10", "Bob,no,20"]
+  let limitedOffset = parseSql("select * from t.csv limit 2 offset 1", resolve)
+  doAssert "offsetCount" in execOp(limitedOffset)
+  doAssert runStaged(limitedOffset) == directRows(limitedOffset).mapIt(it.join(","))
+  doAssert runStaged(limitedOffset) == @["Bob,no,20", "Ada,yes,7"]
+  let offsetOnly = parseSql("select * from t.csv offset 1", resolve)
+  doAssert runStaged(offsetOnly) == directRows(offsetOnly).mapIt(it.join(","))
+  doAssert runStaged(offsetOnly) == @["Bob,no,20", "Ada,yes,7"]
+  let offsetZero = parseSql("select * from t.csv offset 0", resolve)
+  doAssert runStaged(offsetZero) == @["Ada,yes,10", "Bob,no,20", "Ada,yes,7"]
+  let offsetLarge = parseSql("select * from t.csv offset 10", resolve)
+  doAssert runStaged(offsetLarge) == @[]
+  doAssert directRows(offsetLarge) == @[]
   let limitZero = parseSql("select * from t.csv limit 0", resolve)
   doAssert runStaged(limitZero) == @[]
   doAssert directRows(limitZero).len == 0
@@ -243,11 +267,21 @@ when isMainModule:
   expectShape("select * from t.csv order by Value desc limit 2", "Limit(2;Sort(Value:desc;Scan(Name,Flag,Value)))", resolve)
   doAssert runStaged(topN) == directRows(topN).mapIt(it.join(","))
   doAssert runStaged(topN) == @["Bob,no,20", "Ada,yes,10"]
+  let orderedOffset = parseSql("select * from t.csv order by Value desc limit 2 offset 1", resolve)
+  doAssert runStaged(orderedOffset) == directRows(orderedOffset).mapIt(it.join(","))
+  doAssert runStaged(orderedOffset) == @["Ada,yes,10", "Ada,yes,7"]
   let groupedLimit = parseSql("select * from t.csv group by Name sum Value limit 1", resolve)
   doAssert runStaged(groupedLimit) == directRows(groupedLimit).mapIt(it.join(","))
   doAssert runStaged(groupedLimit).len == 1
+  let groupedOffset = parseSql("select * from t.csv group by Name sum Value offset 1", resolve)
+  doAssert runStaged(groupedOffset) == directRows(groupedOffset).mapIt(it.join(","))
+  doAssert runStaged(groupedOffset).len == 1
   try:
     discard parseSql("select * from t.csv limit nope", resolve)
+    doAssert false
+  except ParseError: discard
+  try:
+    discard parseSql("select * from t.csv offset nope", resolve)
     doAssert false
   except ParseError: discard
   doAssert runStaged(parseSql("select * from t.csv where Flag='yes'", resolve)) == @["Ada,yes,10", "Ada,yes,7"]
