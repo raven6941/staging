@@ -34,7 +34,7 @@ type
     binder, field: string
   NameValueNode = ref object of IRNode
     name: Rep[string]
-  ScalarKind = enum skEq, skLt, skLe, skGt, skGe, skAnd, skAdd, skSub
+  ScalarKind = enum skEq, skLt, skLe, skGt, skGe, skAnd, skOr, skNot, skAdd, skSub
   ScalarNode[T] = ref object of IRNode
     kind: ScalarKind
     left, right: Rep[T]
@@ -49,6 +49,12 @@ type
     sourceDb, table: string
     body: Rep[seq[B]]
     ff: FunRecord[B]
+  PredicateKind = enum pkAbove, pkBelow, pkAnd, pkOr, pkNot
+  Predicate = ref object
+    case kind: PredicateKind
+    of pkAbove, pkBelow: a: int
+    of pkAnd, pkOr: leftPred, rightPred: Predicate
+    of pkNot: operand: Predicate
 
 var funCounter = 0
 
@@ -94,6 +100,27 @@ proc gtR(a, b: Rep[int]): Rep[bool] =
 proc andR(a, b: Rep[bool]): Rep[bool] =
   if a.isStatic and b.isStatic: liftNow(a.staticVal and b.staticVal)
   else: dynamic[bool](ScalarNode[bool](kind: skAnd, left: a, right: b))
+proc orR(a, b: Rep[bool]): Rep[bool] =
+  if a.isStatic and b.isStatic: liftNow(a.staticVal or b.staticVal)
+  else: dynamic[bool](ScalarNode[bool](kind: skOr, left: a, right: b))
+proc notR(a: Rep[bool]): Rep[bool] =
+  if a.isStatic: liftNow(not a.staticVal)
+  else: dynamic[bool](ScalarNode[bool](kind: skNot, left: a, right: liftNow(true)))
+
+proc Above(a: int): Predicate = Predicate(kind: pkAbove, a: a)
+proc Below(a: int): Predicate = Predicate(kind: pkBelow, a: a)
+proc And(t, u: Predicate): Predicate = Predicate(kind: pkAnd, leftPred: t, rightPred: u)
+proc Or(t, u: Predicate): Predicate = Predicate(kind: pkOr, leftPred: t, rightPred: u)
+proc Not(t: Predicate): Predicate = Predicate(kind: pkNot, operand: t)
+
+proc P(t: Predicate): proc(x: Rep[int]): Rep[bool] {.closure.} =
+  result = proc(x: Rep[int]): Rep[bool] {.closure.} =
+    case t.kind
+    of pkAbove: leR(liftNow(t.a), x)
+    of pkBelow: ltR(x, liftNow(t.a))
+    of pkAnd: andR(P(t.leftPred)(x), P(t.rightPred)(x))
+    of pkOr: orR(P(t.leftPred)(x), P(t.rightPred)(x))
+    of pkNot: notR(P(t.operand)(x))
 
 proc ifThenElseList[T](c: Rep[bool], t, e: Rep[seq[T]]): Rep[seq[T]] =
   let tn = ListNode[T](t.node); let en = ListNode[T](e.node)
@@ -162,6 +189,11 @@ proc listMap[A, B](l: Rep[seq[A]], f: proc(x: Rep[A]): Rep[B] {.closure.}): Rep[
 proc listFilter[A](l: Rep[seq[A]], f: proc(x: Rep[A]): Rep[bool] {.closure.}): Rep[seq[A]] =
   dbfor(l, proc(x: Rep[A]): Rep[seq[A]] = listIf(f(x), yieldList(x), emptyList[A]()))
 
+let db = database("db")
+proc satisfies(p: proc(x: Rep[int]): Rep[bool] {.closure.}): Rep[seq[NameRow]] =
+  listMap(listFilter(people(db), proc(x: Rep[PersonRow]): Rep[bool] {.closure.} = p(ageOf(x))),
+    proc(x: Rep[PersonRow]): Rep[NameRow] {.closure.} = nameValue(nameOf(x)))
+
 proc range(db: Rep[PeopleDB], a, b: Rep[int]): Rep[seq[NameRow]] =
   listMap(listFilter(people(db), proc(x: Rep[PersonRow]): Rep[bool] {.closure.} = andR(leR(a, ageOf(x)), ltR(ageOf(x), b))),
     proc(x: Rep[PersonRow]): Rep[NameRow] {.closure.} = nameValue(nameOf(x)))
@@ -200,7 +232,11 @@ proc emitBool(r: Rep[bool]): string =
   if r.node of ScalarNode[string]:
     return "(" & emitString(ScalarNode[string](r.node).left) & " == " & emitString(ScalarNode[string](r.node).right) & ")"
   let n = ScalarNode[bool](r.node)
-  "(" & emitBool(n.left) & " and " & emitBool(n.right) & ")"
+  case n.kind
+  of skAnd: "(" & emitBool(n.left) & " and " & emitBool(n.right) & ")"
+  of skOr: "(" & emitBool(n.left) & " or " & emitBool(n.right) & ")"
+  of skNot: "(not " & emitBool(n.left) & ")"
+  else: raise newException(ValueError, "bad bool node")
 
 proc emitNames(r: Rep[seq[NameRow]], outName, indent: string): string
 proc emitInts(r: Rep[seq[int]], outName, indent: string): string
@@ -235,6 +271,9 @@ proc oracleAge(db: PeopleDB, s: string): seq[int] =
 proc oracleRangeNames(db: PeopleDB, s, t: string): seq[string] =
   for a in oracleAge(db, s):
     for b in oracleAge(db, t): result.add(oracleRange(db, a, b))
+proc oracleSatisfies(db: PeopleDB, pred: proc(age: int): bool): seq[string] =
+  for p in db.people:
+    if pred(p.age): result.add(p.name)
 
 proc compileRun(src: string): string =
   let dir = getTempDir() / ("linq-" & $epochTime().int)
@@ -326,11 +365,26 @@ proc linqCallbacksOpen(): TraversalCallbacks[IRNode] =
 
 when isMainModule:
   let data = PeopleDB(people: @[Person(name: "Alex", age: 60), Person(name: "Bert", age: 55), Person(name: "Cora", age: 33), Person(name: "Drew", age: 31), Person(name: "Edna", age: 21), Person(name: "Fred", age: 60)], couples: @[Couple(her: "Alex", him: "Bert"), Couple(her: "Cora", him: "Drew")])
-  let db = database("db")
   let q = rangeFromNames(db, liftNow("Edna"), liftNow("Bert"))
   doAssert oracleRangeNames(data, "Edna", "Bert") == @["Cora", "Drew", "Edna"]
   let source = "type Person = object\n  name: string\n  age: int\ntype NameRow = object\n  name: string\ntype DB = object\n  people: seq[Person]\nlet db = DB(people: @[Person(name: \"Alex\", age: 60), Person(name: \"Bert\", age: 55), Person(name: \"Cora\", age: 33), Person(name: \"Drew\", age: 31), Person(name: \"Edna\", age: 21), Person(name: \"Fred\", age: 60)])\nvar results: seq[NameRow] = @[]\n" & emitNames(q, "results", "") & "for x in results: echo x.name\n"
   doAssert compileRun(source) == "Cora\nDrew\nEdna"
+  let t0 = And(Above(30), Below(40))
+  let thirtySomethings3 = satisfies(P(t0))
+  let t1 = Not(Or(Below(30), Above(40)))
+  let thirtySomethings4 = satisfies(P(t1))
+  let aboveFifty = satisfies(P(Above(50)))
+  let nestedPredicate = satisfies(P(Or(Above(55), Below(25))))
+  proc runNames(q: Rep[seq[NameRow]]): string =
+    let src = "type Person = object\n  name: string\n  age: int\ntype NameRow = object\n  name: string\ntype DB = object\n  people: seq[Person]\nlet db = DB(people: @[Person(name: \"Alex\", age: 60), Person(name: \"Bert\", age: 55), Person(name: \"Cora\", age: 33), Person(name: \"Drew\", age: 31), Person(name: \"Edna\", age: 21), Person(name: \"Fred\", age: 60)])\nvar results: seq[NameRow] = @[]\n" & emitNames(q, "results", "") & "for x in results: echo x.name\n"
+    compileRun(src)
+  doAssert runNames(thirtySomethings3) == oracleSatisfies(data, proc(age: int): bool = 30 <= age and age < 40).join("\n")
+  doAssert runNames(thirtySomethings4) == oracleSatisfies(data, proc(age: int): bool = not (age < 30 or age >= 40)).join("\n")
+  doAssert runNames(aboveFifty) == oracleSatisfies(data, proc(age: int): bool = age >= 50).join("\n")
+  doAssert runNames(nestedPredicate) == oracleSatisfies(data, proc(age: int): bool = age >= 55 or age < 25).join("\n")
+  let predicateResidual = emitNames(aboveFifty, "results", "")
+  doAssert predicateResidual.contains("for") and predicateResidual.contains("<=")
+  doAssert "Predicate" notin predicateResidual and "P(" notin predicateResidual
   let thirty = range(db, liftNow(30), liftNow(40))
   doAssert thirty.node of DBForNode[NameRow]
   doAssert emitNames(thirty, "out", "").contains("for")
