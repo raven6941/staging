@@ -11,6 +11,23 @@ type
   PeopleDB = object
     people: seq[Person]
     couples: seq[Couple]
+  DptRow = object
+    dpt: Rep[string]
+  EmpRow = object
+    dpt, emp: Rep[string]
+  TaskRow = object
+    emp, tsk: Rep[string]
+  OrgDpt = object
+    dpt: string
+  OrgEmp = object
+    dpt, emp: string
+  OrgTask = object
+    emp, tsk: string
+  OrgDB = object
+    departments: seq[OrgDpt]
+    employees: seq[OrgEmp]
+    tasks: seq[OrgTask]
+  EmptyRow = object
   NameRow = object
     name: Rep[string]
   PersonRow = object
@@ -26,7 +43,7 @@ type
   DatabaseNode = ref object of IRNode
     name: string
   TableNode = ref object of IRNode
-    db: Rep[PeopleDB]
+    db: string
     table: string
   RowNode = ref object of IRNode
     binder: string
@@ -34,6 +51,10 @@ type
     binder, field: string
   NameValueNode = ref object of IRNode
     name: Rep[string]
+  DptValueNode = ref object of IRNode
+    dpt: Rep[string]
+  ExistsNode[T] = ref object of IRNode
+    source: Rep[seq[T]]
   ScalarKind = enum skEq, skLt, skLe, skGt, skGe, skAnd, skOr, skNot, skAdd, skSub
   ScalarNode[T] = ref object of IRNode
     kind: ScalarKind
@@ -68,13 +89,16 @@ proc listIf[T](c: Rep[bool], t, e: Rep[seq[T]]): Rep[seq[T]] =
   if c.isStatic: (if c.staticVal: t else: e)
   else: dynamic[seq[T]](ListNode[T](kind: lkIf, cond: c, thenB: t, elseB: e))
 
-proc database(name: string): Rep[PeopleDB] =
-  dynamic[PeopleDB](DatabaseNode(name: name))
+proc database[T](name: string): Rep[T] = dynamic[T](DatabaseNode(name: name))
 
-proc table[T](db: Rep[PeopleDB], name: string): Rep[seq[T]] =
-  dynamic[seq[T]](TableNode(db: db, table: name))
+proc table[T, D](db: Rep[D], name: string): Rep[seq[T]] =
+  dynamic[seq[T]](TableNode(db: DatabaseNode(db.node).name, table: name))
 
-proc people(db: Rep[PeopleDB]): Rep[seq[PersonRow]] = table[PersonRow](db, "people")
+proc people(db: Rep[PeopleDB]): Rep[seq[PersonRow]] = table[PersonRow, PeopleDB](db, "people")
+
+proc departments(db: Rep[OrgDB]): Rep[seq[DptRow]] = table[DptRow, OrgDB](db, "departments")
+proc employees(db: Rep[OrgDB]): Rep[seq[EmpRow]] = table[EmpRow, OrgDB](db, "employees")
+proc tasks(db: Rep[OrgDB]): Rep[seq[TaskRow]] = table[TaskRow, OrgDB](db, "tasks")
 
 proc rowField[T](x: Rep[PersonRow], name: string): Rep[T] =
   if x.isStatic: raise newException(ValueError, "static row field")
@@ -84,6 +108,19 @@ proc rowField[T](x: Rep[PersonRow], name: string): Rep[T] =
 proc nameOf(x: Rep[PersonRow]): Rep[string] = rowField[string](x, "name")
 proc ageOf(x: Rep[PersonRow]): Rep[int] = rowField[int](x, "age")
 proc nameValue(x: Rep[string]): Rep[NameRow] = dynamic[NameRow](NameValueNode(name: x))
+proc orgField[A, T](x: Rep[A], name: string): Rep[T] =
+  dynamic[T](FieldNode(binder: RowNode(x.node).binder, field: name))
+proc dptOf(x: Rep[DptRow]): Rep[string] = orgField[DptRow, string](x, "dpt")
+proc empDptOf(x: Rep[EmpRow]): Rep[string] = orgField[EmpRow, string](x, "dpt")
+proc empOf(x: Rep[EmpRow]): Rep[string] = orgField[EmpRow, string](x, "emp")
+proc taskEmpOf(x: Rep[TaskRow]): Rep[string] = orgField[TaskRow, string](x, "emp")
+proc taskNameOf(x: Rep[TaskRow]): Rep[string] = orgField[TaskRow, string](x, "tsk")
+proc dptValue(x: Rep[string]): Rep[DptRow] = dynamic[DptRow](DptValueNode(dpt: x))
+
+proc exists[T](xs: Rep[seq[T]]): Rep[bool] =
+  if xs.node of ListNode[T] and ListNode[T](xs.node).kind == lkEmpty: liftNow(false)
+  else: dynamic[bool](ExistsNode[T](source: xs))
+proc emptyRow(): Rep[EmptyRow] = dynamic[EmptyRow](RowNode(binder: "empty"))
 
 proc eqR[T](a, b: Rep[T]): Rep[bool] =
   if a.isStatic and b.isStatic: liftNow(a.staticVal == b.staticVal)
@@ -179,7 +216,7 @@ proc dbfor[A, B](l: Rep[seq[A]], f: proc(x: Rep[A]): Rep[seq[B]] {.closure.}): R
     if body.node of ListNode[B] and ListNode[B](body.node).kind == lkEmpty:
       return emptyList[B]()
     let ff = FunRecord[B](binder: RowNode(binder.node).binder, body: body)
-    return dynamic[seq[B]](DBForNode[B](sourceDb: DatabaseNode(t.db.node).name,
+    return dynamic[seq[B]](DBForNode[B](sourceDb: t.db,
       table: t.table, binder: ff.binder, body: body, ff: ff))
   raise newException(ValueError, "cannot normalize for expression")
 
@@ -189,7 +226,7 @@ proc listMap[A, B](l: Rep[seq[A]], f: proc(x: Rep[A]): Rep[B] {.closure.}): Rep[
 proc listFilter[A](l: Rep[seq[A]], f: proc(x: Rep[A]): Rep[bool] {.closure.}): Rep[seq[A]] =
   dbfor(l, proc(x: Rep[A]): Rep[seq[A]] = listIf(f(x), yieldList(x), emptyList[A]()))
 
-let db = database("db")
+let db = database[PeopleDB]("db")
 proc satisfies(p: proc(x: Rep[int]): Rep[bool] {.closure.}): Rep[seq[NameRow]] =
   listMap(listFilter(people(db), proc(x: Rep[PersonRow]): Rep[bool] {.closure.} = p(ageOf(x))),
     proc(x: Rep[PersonRow]): Rep[NameRow] {.closure.} = nameValue(nameOf(x)))
@@ -204,6 +241,20 @@ proc rangeFromNames(db: Rep[PeopleDB], s, t: Rep[string]): Rep[seq[NameRow]] =
   listFlatMap(ageFromName(db, s), proc(a: Rep[int]): Rep[seq[NameRow]] {.closure.} =
     listFlatMap(ageFromName(db, t), proc(b: Rep[int]): Rep[seq[NameRow]] {.closure.} = range(db, a, b)))
 
+let org = database[OrgDB]("org")
+proc taskMatches(e: Rep[EmpRow], u: Rep[string]): Rep[bool] =
+  exists(listMap(listFilter(tasks(org), proc(t: Rep[TaskRow]): Rep[bool] {.closure.} =
+    andR(eqR(empOf(e), taskEmpOf(t)), eqR(taskNameOf(t), u))),
+    proc(t: Rep[TaskRow]): Rep[EmptyRow] {.closure.} = emptyRow()))
+proc employeeMatches(d: Rep[DptRow], u: Rep[string]): Rep[bool] =
+  exists(listMap(listFilter(employees(org), proc(e: Rep[EmpRow]): Rep[bool] {.closure.} =
+    andR(eqR(dptOf(d), empDptOf(e)), notR(taskMatches(e, u)))),
+    proc(e: Rep[EmpRow]): Rep[EmptyRow] {.closure.} = emptyRow()))
+proc expertise(u: Rep[string]): Rep[seq[DptRow]] =
+  listMap(listFilter(departments(org), proc(d: Rep[DptRow]): Rep[bool] {.closure.} =
+    notR(employeeMatches(d, u))),
+  proc(d: Rep[DptRow]): Rep[DptRow] {.closure.} = dptValue(dptOf(d)))
+
 proc emitInt(r: Rep[int]): string
 proc emitString(r: Rep[string]): string
 proc emitBool(r: Rep[bool]): string
@@ -217,7 +268,8 @@ proc emitInt(r: Rep[int]): string =
   else: raise newException(ValueError, "bad int node")
 proc emitString(r: Rep[string]): string =
   if r.isStatic: return "\"" & r.staticVal & "\""
-  FieldNode(r.node).binder & ".name"
+  let f = FieldNode(r.node)
+  f.binder & "." & f.field
 proc emitBool(r: Rep[bool]): string =
   if r.isStatic: return (if r.staticVal: "true" else: "false")
   if r.node of ScalarNode[int]:
@@ -238,8 +290,47 @@ proc emitBool(r: Rep[bool]): string =
   of skNot: "(not " & emitBool(n.left) & ")"
   else: raise newException(ValueError, "bad bool node")
 
+var existsCounter = 0
+
+proc emitBoolHoisted(r: Rep[bool], indent: string): tuple[pre, expr: string]
+proc emitEmpty(r: Rep[seq[EmptyRow]], indent: string, flag: string): string =
+  if r.node of DBForNode[EmptyRow]:
+    let n = DBForNode[EmptyRow](r.node)
+    return indent & "for " & n.binder & " in org." & n.table & ":\n" &
+      emitEmpty(n.body, indent & "  ", flag)
+  let n = ListNode[EmptyRow](r.node)
+  case n.kind
+  of lkEmpty: ""
+  of lkYield: indent & flag & " = true\n"
+  of lkConcat: emitEmpty(n.left, indent, flag) & emitEmpty(n.right, indent, flag)
+  of lkIf:
+    let c = emitBoolHoisted(n.cond, indent)
+    c.pre & indent & "if " & c.expr & ":\n" & emitEmpty(n.thenB, indent & "  ", flag)
+
+proc emitBoolHoisted(r: Rep[bool], indent: string): tuple[pre, expr: string] =
+  if r.node of ExistsNode[EmptyRow]:
+    inc existsCounter
+    let flag = "exists" & $existsCounter
+    let e = ExistsNode[EmptyRow](r.node)
+    return (indent & "var " & flag & " = false\n" & emitEmpty(e.source, indent, flag), flag)
+  if r.node of ScalarNode[string] or r.node of ScalarNode[int]:
+    return ("", emitBool(r))
+  if r.node of ScalarNode[bool]:
+    let n = ScalarNode[bool](r.node)
+    case n.kind
+    of skAnd, skOr:
+      let a = emitBoolHoisted(n.left, indent)
+      let b = emitBoolHoisted(n.right, indent)
+      return (a.pre & b.pre, "(" & a.expr & (if n.kind == skAnd: " and " else: " or ") & b.expr & ")")
+    of skNot:
+      let a = emitBoolHoisted(n.left, indent)
+      return (a.pre, "(not " & a.expr & ")")
+    else: discard
+  ("", emitBool(r))
+
 proc emitNames(r: Rep[seq[NameRow]], outName, indent: string): string
 proc emitInts(r: Rep[seq[int]], outName, indent: string): string
+proc emitDpts(r: Rep[seq[DptRow]], outName, indent: string): string
 proc emitNames(r: Rep[seq[NameRow]], outName, indent: string): string =
   if r.isStatic: return ""
   if r.node of DBForNode[NameRow]:
@@ -250,7 +341,9 @@ proc emitNames(r: Rep[seq[NameRow]], outName, indent: string): string =
   of lkEmpty: ""
   of lkYield: indent & outName & ".add(NameRow(name: " & emitString(NameValueNode(n.elem.node).name) & "))\n"
   of lkConcat: emitNames(n.left, outName, indent) & emitNames(n.right, outName, indent)
-  of lkIf: indent & "if " & emitBool(n.cond) & ":\n" & emitNames(n.thenB, outName, indent & "  ")
+  of lkIf:
+    let c = emitBoolHoisted(n.cond, indent)
+    c.pre & indent & "if " & c.expr & ":\n" & emitNames(n.thenB, outName, indent & "  ")
 proc emitInts(r: Rep[seq[int]], outName, indent: string): string =
   if r.node of DBForNode[int]:
     let n = DBForNode[int](r.node)
@@ -260,7 +353,22 @@ proc emitInts(r: Rep[seq[int]], outName, indent: string): string =
   of lkEmpty: ""
   of lkYield: indent & outName & ".add(" & emitInt(n.elem) & ")\n"
   of lkConcat: emitInts(n.left, outName, indent) & emitInts(n.right, outName, indent)
-  of lkIf: indent & "if " & emitBool(n.cond) & ":\n" & emitInts(n.thenB, outName, indent & "  ")
+  of lkIf:
+    let c = emitBoolHoisted(n.cond, indent)
+    c.pre & indent & "if " & c.expr & ":\n" & emitInts(n.thenB, outName, indent & "  ")
+
+proc emitDpts(r: Rep[seq[DptRow]], outName, indent: string): string =
+  if r.node of DBForNode[DptRow]:
+    let n = DBForNode[DptRow](r.node)
+    return indent & "for " & n.binder & " in org." & n.table & ":\n" & emitDpts(n.body, outName, indent & "  ")
+  let n = ListNode[DptRow](r.node)
+  case n.kind
+  of lkEmpty: ""
+  of lkYield: indent & outName & ".add(DptRow(dpt: " & emitString(DptValueNode(n.elem.node).dpt) & "))\n"
+  of lkConcat: emitDpts(n.left, outName, indent) & emitDpts(n.right, outName, indent)
+  of lkIf:
+    let c = emitBoolHoisted(n.cond, indent)
+    c.pre & indent & "if " & c.expr & ":\n" & emitDpts(n.thenB, outName, indent & "  ")
 
 proc oracleRange(db: PeopleDB, a, b: int): seq[string] =
   for p in db.people:
@@ -297,6 +405,18 @@ proc linqChildren(n: IRNode): seq[IRNode] =
   elif n of DBForNode[PersonRow]:
     let d = DBForNode[PersonRow](n)
     if not d.body.isStatic: result.add(d.body.node)
+  elif n of DBForNode[DptRow]:
+    let d = DBForNode[DptRow](n)
+    if not d.body.isStatic: result.add(d.body.node)
+  elif n of DBForNode[EmpRow]:
+    let d = DBForNode[EmpRow](n)
+    if not d.body.isStatic: result.add(d.body.node)
+  elif n of DBForNode[TaskRow]:
+    let d = DBForNode[TaskRow](n)
+    if not d.body.isStatic: result.add(d.body.node)
+  elif n of DBForNode[EmptyRow]:
+    let d = DBForNode[EmptyRow](n)
+    if not d.body.isStatic: result.add(d.body.node)
   elif n of ListNode[NameRow]:
     let l = ListNode[NameRow](n)
     case l.kind
@@ -323,9 +443,27 @@ proc linqChildren(n: IRNode): seq[IRNode] =
       if not l.cond.isStatic: result.add(l.cond.node)
       if not l.thenB.isStatic: result.add(l.thenB.node)
       if not l.elseB.isStatic: result.add(l.elseB.node)
+  elif n of ListNode[DptRow]:
+    let l = ListNode[DptRow](n)
+    case l.kind
+    of lkEmpty: discard
+    of lkYield:
+      if not l.elem.isStatic: result.add(l.elem.node)
+    of lkConcat:
+      if not l.left.isStatic: result.add(l.left.node)
+      if not l.right.isStatic: result.add(l.right.node)
+    of lkIf:
+      if not l.cond.isStatic: result.add(l.cond.node)
+      if not l.thenB.isStatic: result.add(l.thenB.node)
   elif n of NameValueNode:
     let v = NameValueNode(n)
     if not v.name.isStatic: result.add(v.name.node)
+  elif n of DptValueNode:
+    let v = DptValueNode(n)
+    if not v.dpt.isStatic: result.add(v.dpt.node)
+  elif n of ExistsNode[EmptyRow]:
+    let e = ExistsNode[EmptyRow](n)
+    if not e.source.isStatic: result.add(e.source.node)
   elif n of ScalarNode[string]:
     let s = ScalarNode[string](n)
     if not s.left.isStatic: result.add(s.left.node)
@@ -339,8 +477,7 @@ proc linqChildren(n: IRNode): seq[IRNode] =
     if not s.left.isStatic: result.add(s.left.node)
     if not s.right.isStatic: result.add(s.right.node)
   elif n of TableNode:
-    let t = TableNode(n)
-    if not t.db.isStatic: result.add(t.db.node)
+    discard
 
 proc linqCallbacks(): TraversalCallbacks[IRNode] =
   ## A DBFor node is a traversal boundary with its row binder, and is
@@ -365,6 +502,10 @@ proc linqCallbacksOpen(): TraversalCallbacks[IRNode] =
 
 when isMainModule:
   let data = PeopleDB(people: @[Person(name: "Alex", age: 60), Person(name: "Bert", age: 55), Person(name: "Cora", age: 33), Person(name: "Drew", age: 31), Person(name: "Edna", age: 21), Person(name: "Fred", age: 60)], couples: @[Couple(her: "Alex", him: "Bert"), Couple(her: "Cora", him: "Drew")])
+  let orgData = OrgDB(
+    departments: @[OrgDpt(dpt: "Product"), OrgDpt(dpt: "Quality"), OrgDpt(dpt: "Research"), OrgDpt(dpt: "Sales")],
+    employees: @[OrgEmp(dpt: "Product", emp: "Alex"), OrgEmp(dpt: "Product", emp: "Bert"), OrgEmp(dpt: "Research", emp: "Cora"), OrgEmp(dpt: "Research", emp: "Drew"), OrgEmp(dpt: "Research", emp: "Edna"), OrgEmp(dpt: "Sales", emp: "Fred")],
+    tasks: @[OrgTask(emp: "Alex", tsk: "build"), OrgTask(emp: "Bert", tsk: "build"), OrgTask(emp: "Cora", tsk: "abstract"), OrgTask(emp: "Cora", tsk: "build"), OrgTask(emp: "Cora", tsk: "design"), OrgTask(emp: "Drew", tsk: "abstract"), OrgTask(emp: "Drew", tsk: "design"), OrgTask(emp: "Edna", tsk: "abstract"), OrgTask(emp: "Edna", tsk: "call"), OrgTask(emp: "Edna", tsk: "design"), OrgTask(emp: "Fred", tsk: "call")])
   let q = rangeFromNames(db, liftNow("Edna"), liftNow("Bert"))
   doAssert oracleRangeNames(data, "Edna", "Bert") == @["Cora", "Drew", "Edna"]
   let source = "type Person = object\n  name: string\n  age: int\ntype NameRow = object\n  name: string\ntype DB = object\n  people: seq[Person]\nlet db = DB(people: @[Person(name: \"Alex\", age: 60), Person(name: \"Bert\", age: 55), Person(name: \"Cora\", age: 33), Person(name: \"Drew\", age: 31), Person(name: \"Edna\", age: 21), Person(name: \"Fred\", age: 60)])\nvar results: seq[NameRow] = @[]\n" & emitNames(q, "results", "") & "for x in results: echo x.name\n"
@@ -437,4 +578,15 @@ when isMainModule:
   let wrapped = concatList(q, q)
   doAssert occurrences(wrapped.node, cb).getOrDefault("field") == 0
   doAssert occurrences(wrapped.node, linqCallbacksOpen()).getOrDefault("field") > 0
+  let orgSource = "type DptRow = object\n  dpt: string\ntype EmpRow = object\n  dpt, emp: string\ntype TaskRow = object\n  emp, tsk: string\ntype Org = object\n  departments: seq[DptRow]\n  employees: seq[EmpRow]\n  tasks: seq[TaskRow]\nlet org = Org(departments: @[DptRow(dpt: \"Product\"), DptRow(dpt: \"Quality\"), DptRow(dpt: \"Research\"), DptRow(dpt: \"Sales\")], employees: @[EmpRow(dpt: \"Product\", emp: \"Alex\"), EmpRow(dpt: \"Product\", emp: \"Bert\"), EmpRow(dpt: \"Research\", emp: \"Cora\"), EmpRow(dpt: \"Research\", emp: \"Drew\"), EmpRow(dpt: \"Research\", emp: \"Edna\"), EmpRow(dpt: \"Sales\", emp: \"Fred\")], tasks: @[TaskRow(emp: \"Alex\", tsk: \"build\"), TaskRow(emp: \"Bert\", tsk: \"build\"), TaskRow(emp: \"Cora\", tsk: \"abstract\"), TaskRow(emp: \"Cora\", tsk: \"build\"), TaskRow(emp: \"Cora\", tsk: \"design\"), TaskRow(emp: \"Drew\", tsk: \"abstract\"), TaskRow(emp: \"Drew\", tsk: \"design\"), TaskRow(emp: \"Edna\", tsk: \"abstract\"), TaskRow(emp: \"Edna\", tsk: \"call\"), TaskRow(emp: \"Edna\", tsk: \"design\"), TaskRow(emp: \"Fred\", tsk: \"call\")])\nvar results: seq[DptRow] = @[]\n" & emitDpts(expertise(liftNow("abstract")), "results", "") & "for x in results: echo x.dpt\n"
+  doAssert compileRun(orgSource) == "Quality\nResearch"
+  let buildResult = compileRun(orgSource.replace("== \"abstract\"", "== \"build\""))
+  doAssert buildResult == "Product\nQuality"
+  doAssert compileRun(orgSource.replace("== \"abstract\"", "== \"call\"")) == "Quality\nSales"
+  let orgResidual = emitDpts(expertise(liftNow("abstract")), "results", "")
+  doAssert orgResidual.contains("var exists") and orgResidual.contains("for")
+  doAssert "exists(" notin orgResidual and "materialize" notin orgResidual
+  let orgWrapped = concatList(expertise(liftNow("abstract")), expertise(liftNow("build")))
+  doAssert occurrences(orgWrapped.node, cb).getOrDefault("field") == 0
+  doAssert occurrences(orgWrapped.node, linqCallbacksOpen()).getOrDefault("field") > 0
   echo "ok: linq staged database comprehensions, normalization, effects, and residual execution"
