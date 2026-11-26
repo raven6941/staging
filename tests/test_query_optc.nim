@@ -71,7 +71,7 @@ type
     kind*: RefKind
     name: string
     value: RField
-  PredicateKind* = enum pkEquals, pkLessThan, pkGreaterThan, pkLessEq, pkGreaterEq, pkAnd, pkOr, pkIn, pkNotIn, pkExists
+  PredicateKind* = enum pkEquals, pkLessThan, pkGreaterThan, pkLessEq, pkGreaterEq, pkAnd, pkOr, pkIn, pkNotIn, pkExists, pkNotExists
   Predicate* = ref object
     kind*: PredicateKind
     left*, right*: Ref
@@ -143,6 +143,8 @@ proc notInSubquery*(fieldRef: Ref; sub: Operator): Predicate =
   Predicate(kind: pkNotIn, left: fieldRef, subquery: sub)
 proc existsSubquery*(sub: Operator): Predicate =
   Predicate(kind: pkExists, subquery: sub)
+proc notExistsSubquery*(sub: Operator): Predicate =
+  Predicate(kind: pkNotExists, subquery: sub)
 
 proc opShape*(q: Operator): string
 
@@ -175,13 +177,14 @@ proc predShape(p: Predicate): string =
   of pkIn: "In(" & refShape(p.left) & ";" & opShape(p.subquery) & ")"
   of pkNotIn: "NotIn(" & refShape(p.left) & ";" & opShape(p.subquery) & ")"
   of pkExists: "Exists(" & opShape(p.subquery) & ")"
+  of pkNotExists: "NotExists(" & opShape(p.subquery) & ")"
 
 proc opShape*(q: Operator): string =
   ## A compact structural view used by the SQL front-end tests.
   case q.kind
   of okScan: "Scan(" & q.schema.join(",") & ")"
   of okFilter:
-    if q.predicate.kind in {pkIn, pkNotIn, pkExists}: "Filter(" & predShape(q.predicate) & ";" & opShape(q.parent) & ")"
+    if q.predicate.kind in {pkIn, pkNotIn, pkExists, pkNotExists}: "Filter(" & predShape(q.predicate) & ";" & opShape(q.parent) & ")"
     else: "Filter(" & opShape(q.parent) & ")"
   of okProject: "Project(" & q.outputSchema.join(",") & ";" & q.inputSchema.join(",") & ";" & opShape(q.parent) & ")"
   of okJoin: "Join(" & opShape(q.parent) & ";" & opShape(q.right) & ")"
@@ -294,6 +297,9 @@ proc predicateMatches(p: Predicate; row: seq[string]; schema: seq[string]; kinds
   of pkExists:
     doAssert columnKinds(p.subquery).len > 0, "EXISTS subquery must have a column"
     result = directRows(p.subquery).len > 0
+  of pkNotExists:
+    doAssert columnKinds(p.subquery).len > 0, "NOT EXISTS subquery must have a column"
+    result = directRows(p.subquery).len == 0
 
 proc validateHaving(p: Predicate; q: Operator) =
   doAssert q.kind == okGroup, "HAVING requires GROUP BY"
@@ -303,7 +309,7 @@ proc validateHaving(p: Predicate; q: Operator) =
     case x.kind
     of pkAnd, pkOr: validate(x.a); validate(x.b)
     of pkIn, pkNotIn: doAssert false, "IN is not allowed in HAVING"
-    of pkExists: doAssert false, "EXISTS is not allowed in HAVING"
+    of pkExists, pkNotExists: doAssert false, "EXISTS is not allowed in HAVING"
     else:
       for r in [x.left, x.right]:
         if r.kind == rkField:
@@ -660,6 +666,11 @@ proc execOpWith(q: Operator; emitRow: proc(f: seq[RField]): Rep[Unit];
       let j = inPreds.find(p)
       doAssert j >= 0
       result = ltI(staticInt(0), vr(inUsed[j]))
+    of pkNotExists:
+      let j = inPreds.find(p)
+      doAssert j >= 0
+      let probe = ltI(staticInt(0), vr(inUsed[j]))
+      result = dynamic[bool](QueryNode(kind: nkNot, boolA: probe))
   var body: Rep[Unit]
   if q.kind == okLimit:
     let count = iv("limitCount")
@@ -991,19 +1002,19 @@ proc execOpWith(q: Operator; emitRow: proc(f: seq[RField]): Rep[Unit];
     proc collectIn(p: Predicate) =
       case p.kind
       of pkAnd, pkOr: collectIn(p.a); collectIn(p.b)
-      of pkIn, pkNotIn, pkExists: inPreds.add(p)
+      of pkIn, pkNotIn, pkExists, pkNotExists: inPreds.add(p)
       else: discard
     collectIn(q.predicate)
     var fillBodies: seq[Rep[Unit]] = @[]
     for j, pred in inPreds:
       var leftKind = fkString
-      if pred.kind != pkExists:
+      if pred.kind notin {pkExists, pkNotExists}:
         doAssert pred.left.kind == rkField, "IN/NOT IN left operand must be a field"
         leftKind = refKind(pred.left, schema, kinds)
       let subKinds = columnKinds(pred.subquery)
-      doAssert subKinds.len > 0, "IN/EXISTS subquery must have a column"
+      doAssert subKinds.len > 0, "IN/EXISTS/NOT EXISTS subquery must have a column"
       let subKind = if subKinds[0]: fkString else: fkInt
-      if pred.kind != pkExists: doAssert leftKind == subKind, "predicate kind mismatch"
+      if pred.kind notin {pkExists, pkNotExists}: doAssert leftKind == subKind, "predicate kind mismatch"
       let used = iv("inUsed" & $j)
       inUsed.add(used)
       if subKind == fkString:
@@ -1059,18 +1070,18 @@ proc execOpWith(q: Operator; emitRow: proc(f: seq[RField]): Rep[Unit];
       proc collectIn(p: Predicate) =
         case p.kind
         of pkAnd, pkOr: collectIn(p.a); collectIn(p.b)
-        of pkIn, pkNotIn, pkExists: inPreds.add(p)
+        of pkIn, pkNotIn, pkExists, pkNotExists: inPreds.add(p)
         else: discard
       collectIn(pred)
       for j, inPred in inPreds:
         var leftKind = fkString
-        if inPred.kind != pkExists:
+        if inPred.kind notin {pkExists, pkNotExists}:
           doAssert inPred.left.kind == rkField, "IN/NOT IN left operand must be a field"
           leftKind = refKind(inPred.left, schema, kinds)
         let subKinds = columnKinds(inPred.subquery)
-        doAssert subKinds.len > 0, "IN/EXISTS subquery must have a column"
+        doAssert subKinds.len > 0, "IN/EXISTS/NOT EXISTS subquery must have a column"
         let subKind = if subKinds[0]: fkString else: fkInt
-        if inPred.kind != pkExists: doAssert leftKind == subKind, "predicate kind mismatch"
+        if inPred.kind notin {pkExists, pkNotExists}: doAssert leftKind == subKind, "predicate kind mismatch"
         let used = iv("inUsed" & $j)
         inUsed.add(used)
         if subKind == fkString:
