@@ -124,7 +124,14 @@ proc refValue(p: var Parser): Ref =
 
 proc comparison(p: var Parser): Predicate =
   let a = p.refValue
-  if p.acceptWord("in"):
+  if p.acceptWord("not"):
+    if not p.acceptWord("in"): raise p.parseError(p.current, "in")
+    if a.kind != rkField: raise p.parseError(p.current, "field before NOT IN")
+    discard p.want(tkLParen)
+    let sub = p.statement
+    discard p.want(tkRParen)
+    result = notInSubquery(a, sub)
+  elif p.acceptWord("in"):
     if a.kind != rkField: raise p.parseError(p.current, "field before IN")
     discard p.want(tkLParen)
     let sub = p.statement
@@ -262,6 +269,7 @@ when isMainModule:
   expectShape("select * from t.csv group by Name min Value", "Group(Name;min:Value;Scan(Name,Flag,Value))", resolve)
   expectShape("select * from t.csv group by Name max Value", "Group(Name;max:Value;Scan(Name,Flag,Value))", resolve)
   expectShape("select * from multi.csv where Name in (select Name from t.csv where Value=20)", "Filter(In(Name;Project(Name;Name;Filter(Scan(Name,Flag,Value))));Scan(Dept,Name,Value))", resolve)
+  expectShape("select * from multi.csv where Name not in (select Name from t.csv where Value=20)", "Filter(NotIn(Name;Project(Name;Name;Filter(Scan(Name,Flag,Value))));Scan(Dept,Name,Value))", resolve)
   expectShape("select * from t.csv group by Name sum Value having sum_Value > 10", "Having(sum_Value>10;Group(Name;sum:Value;Scan(Name,Flag,Value)))", resolve)
   expectShape("select * from t.csv group by Name sum Value, min Value", "Group(Name;sum:Value,min:Value;Scan(Name,Flag,Value))", resolve)
   expectShape("select * from t.csv order by Value desc", "Sort(Value:desc;Scan(Name,Flag,Value))", resolve)
@@ -337,6 +345,30 @@ when isMainModule:
   let inEmpty = parseSql("select * from t.csv where Name in (select Name from empty.csv)", resolve)
   doAssert runStaged(inEmpty) == directRows(inEmpty).mapIt(it.join(","))
   doAssert runStaged(inEmpty) == @[]
+  # Load-bearing: this assertion fails if the residual NOT IN probe is
+  # stubbed or inverted (verified by stubbing it once, observing the failure,
+  # then restoring it).
+  let notInString = parseSql("select * from multi.csv where Name not in (select Name from t.csv where Value=20)", resolve)
+  doAssert runStaged(notInString) == directRows(notInString).mapIt(it.join(","))
+  doAssert runStaged(notInString) == @["10,Ada,2", "10,Ada,5"]
+  let notInInt = parseSql("select Dept from multi.csv where Dept not in (select Value from t.csv)", resolve)
+  doAssert runStaged(notInInt) == directRows(notInInt).mapIt(it.join(","))
+  doAssert runStaged(notInInt) == @[]
+  let notInAnd = parseSql("select * from t.csv where Name not in (select Name from multi.csv) and Value=10", resolve)
+  doAssert runStaged(notInAnd) == directRows(notInAnd).mapIt(it.join(","))
+  doAssert runStaged(notInAnd) == @[]
+  let notInAndSurvives = parseSql("select * from t.csv where Name not in (select Name from t.csv where Value=20) and Value=10", resolve)
+  doAssert runStaged(notInAndSurvives) == directRows(notInAndSurvives).mapIt(it.join(","))
+  doAssert runStaged(notInAndSurvives) == @["Ada,yes,10"]
+  let notInGrouped = parseSql("select * from t.csv where Name not in (select Name from multi.csv group by Name sum Value)", resolve)
+  doAssert runStaged(notInGrouped) == directRows(notInGrouped).mapIt(it.join(","))
+  doAssert runStaged(notInGrouped) == @[]
+  let notInGroupedSurvives = parseSql("select * from multi.csv where Name not in (select Name from t.csv where Value=20 group by Name sum Value)", resolve)
+  doAssert runStaged(notInGroupedSurvives) == directRows(notInGroupedSurvives).mapIt(it.join(","))
+  doAssert runStaged(notInGroupedSurvives) == @["10,Ada,2", "10,Ada,5"]
+  let notInEmpty = parseSql("select * from t.csv where Name not in (select Name from empty.csv)", resolve)
+  doAssert runStaged(notInEmpty) == directRows(notInEmpty).mapIt(it.join(","))
+  doAssert runStaged(notInEmpty) == @["Ada,yes,10", "Bob,no,20", "Ada,yes,7"]
   var badInDirect = false
   try: discard directRows(parseSql("select * from t.csv where Value in (select Name from multi.csv)", resolve))
   except AssertionDefect: badInDirect = true
@@ -345,6 +377,14 @@ when isMainModule:
   try: discard runStaged(parseSql("select * from t.csv where Value in (select Name from multi.csv)", resolve))
   except AssertionDefect: badInStaged = true
   doAssert badInStaged
+  var badNotInDirect = false
+  try: discard directRows(parseSql("select * from t.csv where Value not in (select Name from multi.csv)", resolve))
+  except AssertionDefect: badNotInDirect = true
+  doAssert badNotInDirect
+  var badNotInStaged = false
+  try: discard runStaged(parseSql("select * from t.csv where Value not in (select Name from multi.csv)", resolve))
+  except AssertionDefect: badNotInStaged = true
+  doAssert badNotInStaged
   let distinctName = parseSql("select distinct Name from t.csv", resolve)
   doAssert runStaged(distinctName) == directRows(distinctName).mapIt(it.join(","))
   doAssert runStaged(distinctName) == @["Ada", "Bob"]
