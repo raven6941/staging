@@ -77,7 +77,7 @@ type
     left*, right*: Ref
     a*, b*: Predicate
   AggKind* = enum akSum, akAvg, akMin, akMax
-  OpKind* = enum okScan, okFilter, okProject, okJoin, okHashJoin, okGroup, okSort, okLimit, okOffset, okHaving, okPrintCSV
+  OpKind* = enum okScan, okFilter, okProject, okJoin, okHashJoin, okGroup, okSort, okLimit, okOffset, okHaving, okDistinct, okPrintCSV
   Operator* = ref object
     kind: OpKind
     csv, csvRight: string
@@ -148,7 +148,7 @@ proc resultSchema*(q: Operator): seq[string] =
     for j, name in q.aggregates:
       aggregateNames.add(aggName(q.aggKinds[j]) & "_" & name)
     q.keys & @["count"] & aggregateNames
-  of okSort, okLimit, okOffset, okHaving: resultSchema(q.parent)
+  of okSort, okLimit, okOffset, okHaving, okDistinct: resultSchema(q.parent)
 
 proc predShape(p: Predicate): string =
   proc refShape(r: Ref): string =
@@ -181,6 +181,7 @@ proc opShape*(q: Operator): string =
   of okLimit: "Limit(" & $q.n & ";" & opShape(q.parent) & ")"
   of okOffset: "Offset(" & $q.n & ";" & opShape(q.parent) & ")"
   of okHaving: "Having(" & predShape(q.predicate) & ";" & opShape(q.parent) & ")"
+  of okDistinct: "Distinct(" & opShape(q.parent) & ")"
   of okPrintCSV: "Print(" & opShape(q.parent) & ")"
 
 proc lookup(s: seq[string]; n: string): int =
@@ -196,6 +197,8 @@ proc offset*(m: int; q: Operator): Operator =
   Operator(kind: okOffset, n: m, parent: q)
 proc having*(pred: Predicate; q: Operator): Operator =
   Operator(kind: okHaving, predicate: pred, parent: q)
+proc distinctOp*(q: Operator): Operator =
+  Operator(kind: okDistinct, parent: q)
 
 proc parseRows*(csv: string; delim = ','): seq[seq[string]] =
   for line in csv.strip.splitLines[1 .. ^1]:
@@ -265,7 +268,7 @@ proc validateHaving(p: Predicate; q: Operator) =
 proc columnKinds(q: Operator): seq[bool] =
   case q.kind
   of okScan: result = sourceKinds(q.csv, q.schema, q.delim)
-  of okFilter, okPrintCSV, okSort, okLimit, okOffset, okHaving: result = columnKinds(q.parent)
+  of okFilter, okPrintCSV, okSort, okLimit, okOffset, okHaving, okDistinct: result = columnKinds(q.parent)
   of okProject:
     let parentSchema = resultSchema(q.parent)
     let input = if q.inputSchema.len == 0: q.outputSchema else: q.inputSchema
@@ -376,6 +379,9 @@ proc directRows(q: Operator): seq[seq[string]] =
     let ps = resultSchema(q.parent); let kinds = columnKinds(q.parent)
     for row in directRows(q.parent):
       if predicateMatches(q.predicate, row, ps, kinds): result.add(row)
+  of okDistinct:
+    for row in directRows(q.parent):
+      if row notin result: result.add(row)
   of okPrintCSV: result = directRows(q.parent)
 
 # Residual constructors.  In particular, Scanner position is a residual Var,
@@ -598,6 +604,58 @@ proc execOpWith(q: Operator; emitRow: proc(f: seq[RField]): Rep[Unit];
     var parentBody: Rep[Unit]
     discard execOpWith(q.parent, wrappedEmitRow, vars, ints, strings, parentBody, false)
     body = parentBody
+  elif q.kind == okDistinct:
+    let kinds = columnKinds(q.parent)
+    var outS: seq[Arr[string]] = @[]
+    var outI: seq[Arr[int]] = @[]
+    for i, isString in kinds:
+      if isString: outS.add(sa("distinctS" & $i)); outI.add(nil)
+      else: outS.add(nil); outI.add(ia("distinctI" & $i))
+    let used = iv("distinctUsed")
+    let scanPos = iv("distinctScan")
+    let priorPos = iv("distinctPrior")
+    let duplicate = iv("distinctDuplicate")
+    proc consume(f: seq[RField]): Rep[Unit] =
+      var writes: seq[Rep[Unit]] = @[]
+      for i, fld in f:
+        if kinds[i]: writes.add(sw(outS[i], vr(used), fld.str.data))
+        else: writes.add(aw(outI[i], vr(used), fld.int.value))
+      writes.add(vw(used, intAdd(vr(used), staticInt(1))))
+      addMany(writes)
+    var parentBody: Rep[Unit]
+    discard execOpWith(q.parent, consume, vars, ints, strings, parentBody, false)
+    proc sameRow(a, b: Rep[int]): Rep[bool] =
+      var same: Rep[bool] = liftNow(true)
+      for i, isString in kinds:
+        if isString:
+          same = andB(same, stringCompare(RString(data:sr(outS[i], a)), RString(data:sr(outS[i], b))))
+        else:
+          same = andB(same, eqI(ar(outI[i], a), ar(outI[i], b)))
+      same
+    let emitDistinct = ifB(eqI(vr(duplicate), staticInt(0)),
+      proc(): Rep[Unit] =
+        var fields: seq[RField] = @[]
+        for i, isString in kinds:
+          if isString: fields.add(RField(kind:fkString, str:RString(data:sr(outS[i], vr(scanPos)))))
+          else: fields.add(RField(kind:fkInt, int:RInt(value:ar(outI[i], vr(scanPos)))))
+        emitRow(fields),
+      proc(): Rep[Unit] = unit())
+    let compareLoop = whileLoop(
+      proc(): Rep[bool] = andB(ltI(vr(priorPos), vr(scanPos)), eqI(vr(duplicate), staticInt(0))),
+      proc(): Rep[Unit] = seqs(
+        ifB(sameRow(vr(scanPos), vr(priorPos)),
+          proc(): Rep[Unit] = vw(duplicate, staticInt(1)),
+          proc(): Rep[Unit] = unit()),
+        vw(priorPos, intAdd(vr(priorPos), staticInt(1))))
+    )
+    let distinctLoop = whileLoop(
+      proc(): Rep[bool] = ltI(vr(scanPos), vr(used)),
+      proc(): Rep[Unit] = seqs(
+        vw(priorPos, staticInt(0)),
+        seqs(vw(duplicate, staticInt(0)), seqs(compareLoop,
+          seqs(emitDistinct, vw(scanPos, intAdd(vr(scanPos), staticInt(1)))))))
+    )
+    body = seqs(parentBody, seqs(vw(scanPos, staticInt(0)), distinctLoop))
   elif q.kind == okSort:
     let schema = resultSchema(q.parent)
     let kinds = columnKinds(q.parent)
@@ -895,7 +953,36 @@ proc execOpWith(q: Operator; emitRow: proc(f: seq[RField]): Rep[Unit];
         let same = predicateRep(pred, loaded, schema, kinds)
         seqs(addMany(writes), seqs(ifB(same, proc(): Rep[Unit] = emit(loaded), proc(): Rep[Unit] = unit()), vw(pos, intAdd(vr(pos), staticInt(1))))))
     else:
-      body = scanRows(source.csv, schema, kinds, source.delim, emit)
+      # Buffer the parent's rows first, then project from the buffer. The
+      # scanner Rep nodes advance the residual scanner position each time
+      # they are emitted, so emitting only the projected fields would
+      # misalign the scanner — each loop iteration would consume one field
+      # instead of one row (verified: `select Name from t.csv` staged
+      # returned all 9 fields on main). Routing the parent through
+      # execOpWith also fixes Project over Group/Join parents, which the
+      # old scanRows(source.csv, ...) path read as raw CSV (for Group,
+      # source.csv is empty, so `select distinct Dept ... group by ...`
+      # staged returned no rows at all).
+      let pos = iv("projectPos")
+      let pkinds = columnKinds(q.parent)
+      var bs: seq[Arr[string]] = @[]
+      var bi: seq[Arr[int]] = @[]
+      for i in 0 ..< schema.len:
+        if pkinds[i]: bs.add(sa("projectS" & $i))
+        else: bi.add(ia("projectI" & $i))
+      var parentBody: Rep[Unit]
+      proc bufferedEmit(f: seq[RField]): Rep[Unit] =
+        var writes: seq[Rep[Unit]] = @[]; var si = 0; var ii = 0
+        for i in 0 ..< schema.len:
+          if pkinds[i]: writes.add(sw(bs[si], vr(pos), f[i].str.data)); inc si
+          else: writes.add(aw(bi[ii], vr(pos), f[i].int.value)); inc ii
+        var loaded: seq[RField] = @[]; si = 0; ii = 0
+        for i in 0 ..< schema.len:
+          if pkinds[i]: loaded.add(RField(kind:fkString,str:RString(data:sr(bs[si],vr(pos))))); inc si
+          else: loaded.add(RField(kind:fkInt,int:RInt(value:ar(bi[ii],vr(pos))))); inc ii
+        seqs(addMany(writes), seqs(emit(loaded), vw(pos, intAdd(vr(pos), staticInt(1)))))
+      discard execOpWith(q.parent, bufferedEmit, vars, ints, strings, parentBody, false)
+      body = parentBody
   elif q.kind == okJoin:
     let ls = resultSchema(q.parent); let rs = resultSchema(q.right)
     let lk = stringCols(q.parent.csv, ls); let rk = stringCols(q.right.csv, rs)

@@ -162,6 +162,8 @@ proc isAggregateWord(t: Token): bool =
 proc statement(p: var Parser): Operator =
   discard p.want(tkWord, "select")
   var outNames, inNames: seq[string]
+  var isDistinct = false
+  if p.acceptWord("distinct"): isDistinct = true
   if p.current.kind == tkStar: discard p.take
   else:
     (outNames, inNames) = p.fieldList(true)
@@ -202,6 +204,7 @@ proc statement(p: var Parser): Operator =
       if p.current.kind != tkComma: break
       discard p.take
   if outNames.len > 0: result = project(outNames, result, inNames)
+  if isDistinct: result = distinctOp(result)
   if orderKeys.len > 0: result = orderBy(orderKeys, orderDirs, result)
   var limitN = -1
   var offsetM = 0
@@ -242,6 +245,8 @@ when isMainModule:
     else: scan(csv, @["Name", "Flag", "Value"])
   expectShape("select * from t.csv", "Scan(Name,Flag,Value)", resolve)
   expectShape("select Name from t.csv", "Project(Name;Name;Scan(Name,Flag,Value))", resolve)
+  expectShape("select distinct Name from t.csv", "Distinct(Project(Name;Name;Scan(Name,Flag,Value)))", resolve)
+  expectShape("select distinct * from t.csv", "Distinct(Scan(Name,Flag,Value))", resolve)
   expectShape("select Name from t.csv where Flag='yes'", "Project(Name;Name;Filter(Scan(Name,Flag,Value)))", resolve)
   expectShape("select * from nestedloops t.csv join (select Name as Name1 from t.csv)", "Join(Scan(Name,Flag,Value);Project(Name1;Name;Scan(Name,Flag,Value)))", resolve)
   expectShape("select * from t.csv join (select Name from t.csv)", "HashJoin(Scan(Name,Flag,Value);Project(Name;Name;Scan(Name,Flag,Value)))", resolve)
@@ -310,6 +315,27 @@ when isMainModule:
   doAssert directRows(parseSql("select * from t.csv where Name<'Bob'", resolve)) == @[@["Ada", "yes", "10"], @["Ada", "yes", "7"]]
   doAssert runStaged(parseSql("select Name as Name1 from t.csv where Name='Ada' and Value=7", resolve)) == @["Ada"]
   doAssert runStaged(parseSql("select * from t.csv where Name='Ada' or Flag='no'", resolve)) == @["Ada,yes,10", "Bob,no,20", "Ada,yes,7"]
+  let distinctName = parseSql("select distinct Name from t.csv", resolve)
+  doAssert runStaged(distinctName) == directRows(distinctName).mapIt(it.join(","))
+  doAssert runStaged(distinctName) == @["Ada", "Bob"]
+  let distinctNameFlag = parseSql("select distinct Name, Flag from t.csv", resolve)
+  doAssert runStaged(distinctNameFlag) == directRows(distinctNameFlag).mapIt(it.join(","))
+  doAssert runStaged(distinctNameFlag) == @["Ada,yes", "Bob,no"]
+  let distinctWhere = parseSql("select distinct Name from t.csv where Flag='yes'", resolve)
+  doAssert runStaged(distinctWhere) == directRows(distinctWhere).mapIt(it.join(","))
+  doAssert runStaged(distinctWhere) == @["Ada"]
+  let distinctOrder = parseSql("select distinct Name from t.csv order by Name desc", resolve)
+  doAssert runStaged(distinctOrder) == directRows(distinctOrder).mapIt(it.join(","))
+  doAssert runStaged(distinctOrder) == @["Bob", "Ada"]
+  let distinctLimit = parseSql("select distinct Name from t.csv limit 1", resolve)
+  doAssert runStaged(distinctLimit) == directRows(distinctLimit).mapIt(it.join(","))
+  doAssert runStaged(distinctLimit) == @["Ada"]
+  let distinctGrouped = parseSql("select distinct Dept from multi.csv group by Dept, Name sum Value", resolve)
+  doAssert runStaged(distinctGrouped) == directRows(distinctGrouped).mapIt(it.join(","))
+  doAssert runStaged(distinctGrouped) == @["10"]
+  let distinctGroupedAll = parseSql("select distinct * from t.csv group by Name sum Value", resolve)
+  doAssert runStaged(distinctGroupedAll) == directRows(distinctGroupedAll).mapIt(it.join(","))
+  doAssert runStaged(distinctGroupedAll) == @["Ada,2,17", "Bob,1,20"]
   let havingGt = parseSql("select * from t.csv group by Name sum Value having sum_Value > 10", resolve)
   doAssert runStaged(havingGt) == directRows(havingGt).mapIt(it.join(","))
   doAssert runStaged(havingGt) == @["Ada,2,17", "Bob,1,20"]
