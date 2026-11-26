@@ -124,7 +124,13 @@ proc refValue(p: var Parser): Ref =
 
 proc comparison(p: var Parser): Predicate =
   let a = p.refValue
-  if p.current.kind == tkEquals:
+  if p.acceptWord("in"):
+    if a.kind != rkField: raise p.parseError(p.current, "field before IN")
+    discard p.want(tkLParen)
+    let sub = p.statement
+    discard p.want(tkRParen)
+    result = inSubquery(a, sub)
+  elif p.current.kind == tkEquals:
     discard p.take; result = equals(a, p.refValue)
   elif p.current.kind == tkLess:
     discard p.take; result = lessThan(a, p.refValue)
@@ -255,6 +261,7 @@ when isMainModule:
   expectShape("select * from t.csv group by Name avg Value", "Group(Name;avg:Value;Scan(Name,Flag,Value))", resolve)
   expectShape("select * from t.csv group by Name min Value", "Group(Name;min:Value;Scan(Name,Flag,Value))", resolve)
   expectShape("select * from t.csv group by Name max Value", "Group(Name;max:Value;Scan(Name,Flag,Value))", resolve)
+  expectShape("select * from multi.csv where Name in (select Name from t.csv where Value=20)", "Filter(In(Name;Project(Name;Name;Filter(Scan(Name,Flag,Value))));Scan(Dept,Name,Value))", resolve)
   expectShape("select * from t.csv group by Name sum Value having sum_Value > 10", "Having(sum_Value>10;Group(Name;sum:Value;Scan(Name,Flag,Value)))", resolve)
   expectShape("select * from t.csv group by Name sum Value, min Value", "Group(Name;sum:Value,min:Value;Scan(Name,Flag,Value))", resolve)
   expectShape("select * from t.csv order by Value desc", "Sort(Value:desc;Scan(Name,Flag,Value))", resolve)
@@ -315,6 +322,29 @@ when isMainModule:
   doAssert directRows(parseSql("select * from t.csv where Name<'Bob'", resolve)) == @[@["Ada", "yes", "10"], @["Ada", "yes", "7"]]
   doAssert runStaged(parseSql("select Name as Name1 from t.csv where Name='Ada' and Value=7", resolve)) == @["Ada"]
   doAssert runStaged(parseSql("select * from t.csv where Name='Ada' or Flag='no'", resolve)) == @["Ada,yes,10", "Bob,no,20", "Ada,yes,7"]
+  let inString = parseSql("select * from multi.csv where Name in (select Name from t.csv where Value=20)", resolve)
+  doAssert runStaged(inString) == directRows(inString).mapIt(it.join(","))
+  doAssert runStaged(inString) == @["10,Bob,3"]
+  let inInt = parseSql("select Dept from multi.csv where Dept in (select Value from t.csv)", resolve)
+  doAssert runStaged(inInt) == directRows(inInt).mapIt(it.join(","))
+  doAssert runStaged(inInt) == @["10", "10", "10"]
+  let inAnd = parseSql("select * from t.csv where Name in (select Name from multi.csv) and Value=10", resolve)
+  doAssert runStaged(inAnd) == directRows(inAnd).mapIt(it.join(","))
+  doAssert runStaged(inAnd) == @["Ada,yes,10"]
+  let inGrouped = parseSql("select * from t.csv where Name in (select Name from multi.csv group by Name sum Value)", resolve)
+  doAssert runStaged(inGrouped) == directRows(inGrouped).mapIt(it.join(","))
+  doAssert runStaged(inGrouped) == @["Ada,yes,10", "Bob,no,20", "Ada,yes,7"]
+  let inEmpty = parseSql("select * from t.csv where Name in (select Name from empty.csv)", resolve)
+  doAssert runStaged(inEmpty) == directRows(inEmpty).mapIt(it.join(","))
+  doAssert runStaged(inEmpty) == @[]
+  var badInDirect = false
+  try: discard directRows(parseSql("select * from t.csv where Value in (select Name from multi.csv)", resolve))
+  except AssertionDefect: badInDirect = true
+  doAssert badInDirect
+  var badInStaged = false
+  try: discard runStaged(parseSql("select * from t.csv where Value in (select Name from multi.csv)", resolve))
+  except AssertionDefect: badInStaged = true
+  doAssert badInStaged
   let distinctName = parseSql("select distinct Name from t.csv", resolve)
   doAssert runStaged(distinctName) == directRows(distinctName).mapIt(it.join(","))
   doAssert runStaged(distinctName) == @["Ada", "Bob"]
