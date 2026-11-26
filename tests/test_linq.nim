@@ -33,6 +33,12 @@ type
   PersonRow = object
     name: Rep[string]
     age: Rep[int]
+  NestedDptRow = object
+    dpt: Rep[string]
+    employees: Rep[seq[NestedEmpRow]]
+  NestedEmpRow = object
+    emp: Rep[string]
+    tasks: Rep[seq[string]]
   ListKind = enum lkEmpty, lkYield, lkConcat, lkIf
   ListNode[T] = ref object of IRNode
     kind: ListKind
@@ -53,6 +59,12 @@ type
     name: Rep[string]
   DptValueNode = ref object of IRNode
     dpt: Rep[string]
+  NestedDptValueNode = ref object of IRNode
+    dpt: Rep[string]
+    employees: Rep[seq[NestedEmpRow]]
+  NestedEmpValueNode = ref object of IRNode
+    emp: Rep[string]
+    tasks: Rep[seq[string]]
   ExistsNode[T] = ref object of IRNode
     source: Rep[seq[T]]
   ScalarKind = enum skEq, skLt, skLe, skGt, skGe, skAnd, skOr, skNot, skAdd, skSub
@@ -116,6 +128,10 @@ proc empOf(x: Rep[EmpRow]): Rep[string] = orgField[EmpRow, string](x, "emp")
 proc taskEmpOf(x: Rep[TaskRow]): Rep[string] = orgField[TaskRow, string](x, "emp")
 proc taskNameOf(x: Rep[TaskRow]): Rep[string] = orgField[TaskRow, string](x, "tsk")
 proc dptValue(x: Rep[string]): Rep[DptRow] = dynamic[DptRow](DptValueNode(dpt: x))
+proc nestedDptValue(dpt: Rep[string], employees: Rep[seq[NestedEmpRow]]): Rep[NestedDptRow] =
+  dynamic[NestedDptRow](NestedDptValueNode(dpt: dpt, employees: employees))
+proc nestedEmpValue(emp: Rep[string], tasks: Rep[seq[string]]): Rep[NestedEmpRow] =
+  dynamic[NestedEmpRow](NestedEmpValueNode(emp: emp, tasks: tasks))
 
 proc exists[T](xs: Rep[seq[T]]): Rep[bool] =
   if xs.node of ListNode[T] and ListNode[T](xs.node).kind == lkEmpty: liftNow(false)
@@ -255,6 +271,17 @@ proc expertise(u: Rep[string]): Rep[seq[DptRow]] =
     notR(employeeMatches(d, u))),
   proc(d: Rep[DptRow]): Rep[DptRow] {.closure.} = dptValue(dptOf(d)))
 
+proc nestedOrgQuery(): Rep[seq[NestedDptRow]] =
+  listMap(departments(org), proc(d: Rep[DptRow]): Rep[NestedDptRow] {.closure.} =
+    nestedDptValue(dptOf(d),
+      listMap(listFilter(employees(org), proc(e: Rep[EmpRow]): Rep[bool] {.closure.} =
+        eqR(dptOf(d), empDptOf(e))),
+      proc(e: Rep[EmpRow]): Rep[NestedEmpRow] {.closure.} =
+        nestedEmpValue(empOf(e),
+          listMap(listFilter(tasks(org), proc(t: Rep[TaskRow]): Rep[bool] {.closure.} =
+            eqR(empOf(e), taskEmpOf(t))),
+          proc(t: Rep[TaskRow]): Rep[string] {.closure.} = taskNameOf(t))))))
+
 proc emitInt(r: Rep[int]): string
 proc emitString(r: Rep[string]): string
 proc emitBool(r: Rep[bool]): string
@@ -331,6 +358,9 @@ proc emitBoolHoisted(r: Rep[bool], indent: string): tuple[pre, expr: string] =
 proc emitNames(r: Rep[seq[NameRow]], outName, indent: string): string
 proc emitInts(r: Rep[seq[int]], outName, indent: string): string
 proc emitDpts(r: Rep[seq[DptRow]], outName, indent: string): string
+proc emitStrings(r: Rep[seq[string]], outName, indent: string): string
+proc emitNestedEmps(r: Rep[seq[NestedEmpRow]], outName, indent: string): string
+proc emitNestedDpts(r: Rep[seq[NestedDptRow]], outName, indent: string): string
 proc emitNames(r: Rep[seq[NameRow]], outName, indent: string): string =
   if r.isStatic: return ""
   if r.node of DBForNode[NameRow]:
@@ -370,6 +400,57 @@ proc emitDpts(r: Rep[seq[DptRow]], outName, indent: string): string =
     let c = emitBoolHoisted(n.cond, indent)
     c.pre & indent & "if " & c.expr & ":\n" & emitDpts(n.thenB, outName, indent & "  ")
 
+proc emitStrings(r: Rep[seq[string]], outName, indent: string): string =
+  if r.node of DBForNode[string]:
+    let n = DBForNode[string](r.node)
+    return indent & "for " & n.binder & " in org." & n.table & ":\n" & emitStrings(n.body, outName, indent & "  ")
+  let n = ListNode[string](r.node)
+  case n.kind
+  of lkEmpty: ""
+  of lkYield: indent & outName & ".add(" & emitString(n.elem) & ")\n"
+  of lkConcat: emitStrings(n.left, outName, indent) & emitStrings(n.right, outName, indent)
+  of lkIf:
+    let c = emitBoolHoisted(n.cond, indent)
+    c.pre & indent & "if " & c.expr & ":\n" & emitStrings(n.thenB, outName, indent & "  ")
+
+proc emitNestedEmps(r: Rep[seq[NestedEmpRow]], outName, indent: string): string =
+  if r.node of DBForNode[NestedEmpRow]:
+    let n = DBForNode[NestedEmpRow](r.node)
+    return indent & "for " & n.binder & " in org." & n.table & ":\n" & emitNestedEmps(n.body, outName, indent & "  ")
+  let n = ListNode[NestedEmpRow](r.node)
+  case n.kind
+  of lkEmpty: ""
+  of lkYield:
+    let v = NestedEmpValueNode(n.elem.node)
+    let tasks = "nestedTasks" & $existsCounter
+    inc existsCounter
+    indent & "block:\n" & indent & "  var " & tasks & ": seq[string] = @[]\n" &
+      emitStrings(v.tasks, tasks, indent & "  ") &
+      indent & "  " & outName & ".add(NestedEmpRow(emp: " & emitString(v.emp) & ", tasks: " & tasks & "))\n"
+  of lkConcat: emitNestedEmps(n.left, outName, indent) & emitNestedEmps(n.right, outName, indent)
+  of lkIf:
+    let c = emitBoolHoisted(n.cond, indent)
+    c.pre & indent & "if " & c.expr & ":\n" & emitNestedEmps(n.thenB, outName, indent & "  ")
+
+proc emitNestedDpts(r: Rep[seq[NestedDptRow]], outName, indent: string): string =
+  if r.node of DBForNode[NestedDptRow]:
+    let n = DBForNode[NestedDptRow](r.node)
+    return indent & "for " & n.binder & " in org." & n.table & ":\n" & emitNestedDpts(n.body, outName, indent & "  ")
+  let n = ListNode[NestedDptRow](r.node)
+  case n.kind
+  of lkEmpty: ""
+  of lkYield:
+    let v = NestedDptValueNode(n.elem.node)
+    let employees = "nestedEmployees" & $existsCounter
+    inc existsCounter
+    indent & "block:\n" & indent & "  var " & employees & ": seq[NestedEmpRow] = @[]\n" &
+      emitNestedEmps(v.employees, employees, indent & "  ") &
+      indent & "  " & outName & ".add(NestedDptRow(dpt: " & emitString(v.dpt) & ", employees: " & employees & "))\n"
+  of lkConcat: emitNestedDpts(n.left, outName, indent) & emitNestedDpts(n.right, outName, indent)
+  of lkIf:
+    let c = emitBoolHoisted(n.cond, indent)
+    c.pre & indent & "if " & c.expr & ":\n" & emitNestedDpts(n.thenB, outName, indent & "  ")
+
 proc oracleRange(db: PeopleDB, a, b: int): seq[string] =
   for p in db.people:
     if a <= p.age and p.age < b: result.add(p.name)
@@ -386,7 +467,7 @@ proc oracleSatisfies(db: PeopleDB, pred: proc(age: int): bool): seq[string] =
 proc compileRun(src: string): string =
   let dir = getTempDir() / ("linq-" & $epochTime().int)
   createDir(dir); let path = dir / "main.nim"; let exe = dir / "main"
-  writeFile(path, src)
+  writeFile(path, "import std/strutils\n" & src)
   let c = execCmdEx(quoteShell(findExe("nim")) & " c --hints:off --nimcache:" & quoteShell(dir / "cache") & " --out:" & quoteShell(exe) & " " & quoteShell(path), {poUsePath, poStdErrToStdOut}, workingDir = dir)
   doAssert c.exitCode == 0, c.output
   let r = execCmdEx(quoteShell(exe), {poUsePath, poStdErrToStdOut}, workingDir = dir)
@@ -416,6 +497,15 @@ proc linqChildren(n: IRNode): seq[IRNode] =
     if not d.body.isStatic: result.add(d.body.node)
   elif n of DBForNode[EmptyRow]:
     let d = DBForNode[EmptyRow](n)
+    if not d.body.isStatic: result.add(d.body.node)
+  elif n of DBForNode[NestedDptRow]:
+    let d = DBForNode[NestedDptRow](n)
+    if not d.body.isStatic: result.add(d.body.node)
+  elif n of DBForNode[NestedEmpRow]:
+    let d = DBForNode[NestedEmpRow](n)
+    if not d.body.isStatic: result.add(d.body.node)
+  elif n of DBForNode[string]:
+    let d = DBForNode[string](n)
     if not d.body.isStatic: result.add(d.body.node)
   elif n of ListNode[NameRow]:
     let l = ListNode[NameRow](n)
@@ -455,12 +545,85 @@ proc linqChildren(n: IRNode): seq[IRNode] =
     of lkIf:
       if not l.cond.isStatic: result.add(l.cond.node)
       if not l.thenB.isStatic: result.add(l.thenB.node)
+  elif n of ListNode[EmpRow]:
+    let l = ListNode[EmpRow](n)
+    case l.kind
+    of lkEmpty: discard
+    of lkYield:
+      if not l.elem.isStatic: result.add(l.elem.node)
+    of lkConcat:
+      if not l.left.isStatic: result.add(l.left.node)
+      if not l.right.isStatic: result.add(l.right.node)
+    of lkIf:
+      if not l.cond.isStatic: result.add(l.cond.node)
+      if not l.thenB.isStatic: result.add(l.thenB.node)
+      if not l.elseB.isStatic: result.add(l.elseB.node)
+  elif n of ListNode[TaskRow]:
+    let l = ListNode[TaskRow](n)
+    case l.kind
+    of lkEmpty: discard
+    of lkYield:
+      if not l.elem.isStatic: result.add(l.elem.node)
+    of lkConcat:
+      if not l.left.isStatic: result.add(l.left.node)
+      if not l.right.isStatic: result.add(l.right.node)
+    of lkIf:
+      if not l.cond.isStatic: result.add(l.cond.node)
+      if not l.thenB.isStatic: result.add(l.thenB.node)
+      if not l.elseB.isStatic: result.add(l.elseB.node)
+  elif n of ListNode[NestedDptRow]:
+    let l = ListNode[NestedDptRow](n)
+    case l.kind
+    of lkEmpty: discard
+    of lkYield:
+      if not l.elem.isStatic: result.add(l.elem.node)
+    of lkConcat:
+      if not l.left.isStatic: result.add(l.left.node)
+      if not l.right.isStatic: result.add(l.right.node)
+    of lkIf:
+      if not l.cond.isStatic: result.add(l.cond.node)
+      if not l.thenB.isStatic: result.add(l.thenB.node)
+      if not l.elseB.isStatic: result.add(l.elseB.node)
+  elif n of ListNode[NestedEmpRow]:
+    let l = ListNode[NestedEmpRow](n)
+    case l.kind
+    of lkEmpty: discard
+    of lkYield:
+      if not l.elem.isStatic: result.add(l.elem.node)
+    of lkConcat:
+      if not l.left.isStatic: result.add(l.left.node)
+      if not l.right.isStatic: result.add(l.right.node)
+    of lkIf:
+      if not l.cond.isStatic: result.add(l.cond.node)
+      if not l.thenB.isStatic: result.add(l.thenB.node)
+      if not l.elseB.isStatic: result.add(l.elseB.node)
+  elif n of ListNode[string]:
+    let l = ListNode[string](n)
+    case l.kind
+    of lkEmpty: discard
+    of lkYield:
+      if not l.elem.isStatic: result.add(l.elem.node)
+    of lkConcat:
+      if not l.left.isStatic: result.add(l.left.node)
+      if not l.right.isStatic: result.add(l.right.node)
+    of lkIf:
+      if not l.cond.isStatic: result.add(l.cond.node)
+      if not l.thenB.isStatic: result.add(l.thenB.node)
+      if not l.elseB.isStatic: result.add(l.elseB.node)
   elif n of NameValueNode:
     let v = NameValueNode(n)
     if not v.name.isStatic: result.add(v.name.node)
   elif n of DptValueNode:
     let v = DptValueNode(n)
     if not v.dpt.isStatic: result.add(v.dpt.node)
+  elif n of NestedDptValueNode:
+    let v = NestedDptValueNode(n)
+    if not v.dpt.isStatic: result.add(v.dpt.node)
+    if not v.employees.isStatic: result.add(v.employees.node)
+  elif n of NestedEmpValueNode:
+    let v = NestedEmpValueNode(n)
+    if not v.emp.isStatic: result.add(v.emp.node)
+    if not v.tasks.isStatic: result.add(v.tasks.node)
   elif n of ExistsNode[EmptyRow]:
     let e = ExistsNode[EmptyRow](n)
     if not e.source.isStatic: result.add(e.source.node)
@@ -589,4 +752,15 @@ when isMainModule:
   let orgWrapped = concatList(expertise(liftNow("abstract")), expertise(liftNow("build")))
   doAssert occurrences(orgWrapped.node, cb).getOrDefault("field") == 0
   doAssert occurrences(orgWrapped.node, linqCallbacksOpen()).getOrDefault("field") > 0
+  let nestedOrg = nestedOrgQuery()
+  let nestedSource = "type NestedEmpRow = object\n  emp: string\n  tasks: seq[string]\ntype NestedDptRow = object\n  dpt: string\n  employees: seq[NestedEmpRow]\ntype OrgDpt = object\n  dpt: string\ntype OrgEmp = object\n  dpt, emp: string\ntype OrgTask = object\n  emp, tsk: string\ntype Org = object\n  departments: seq[OrgDpt]\n  employees: seq[OrgEmp]\n  tasks: seq[OrgTask]\nlet org = Org(departments: @[OrgDpt(dpt: \"Product\"), OrgDpt(dpt: \"Quality\"), OrgDpt(dpt: \"Research\"), OrgDpt(dpt: \"Sales\")], employees: @[OrgEmp(dpt: \"Product\", emp: \"Alex\"), OrgEmp(dpt: \"Product\", emp: \"Bert\"), OrgEmp(dpt: \"Research\", emp: \"Cora\"), OrgEmp(dpt: \"Research\", emp: \"Drew\"), OrgEmp(dpt: \"Research\", emp: \"Edna\"), OrgEmp(dpt: \"Sales\", emp: \"Fred\")], tasks: @[OrgTask(emp: \"Alex\", tsk: \"build\"), OrgTask(emp: \"Bert\", tsk: \"build\"), OrgTask(emp: \"Cora\", tsk: \"abstract\"), OrgTask(emp: \"Cora\", tsk: \"build\"), OrgTask(emp: \"Cora\", tsk: \"design\"), OrgTask(emp: \"Drew\", tsk: \"abstract\"), OrgTask(emp: \"Drew\", tsk: \"design\"), OrgTask(emp: \"Edna\", tsk: \"abstract\"), OrgTask(emp: \"Edna\", tsk: \"call\"), OrgTask(emp: \"Edna\", tsk: \"design\"), OrgTask(emp: \"Fred\", tsk: \"call\")])\nvar results: seq[NestedDptRow] = @[]\n" & emitNestedDpts(nestedOrg, "results", "") & "for d in results:\n  if d.employees.len == 0:\n    echo d.dpt & \"|\"\n  else:\n    for e in d.employees:\n      echo d.dpt & \"|\" & e.emp & \"|\" & e.tasks.join(\",\")\n"
+  let nestedOracle = "Product|Alex|build\nProduct|Bert|build\nQuality|\nResearch|Cora|abstract,build,design\nResearch|Drew|abstract,design\nResearch|Edna|abstract,call,design\nSales|Fred|call"
+  doAssert compileRun(nestedSource) == nestedOracle
+  let nestedResidual = emitNestedDpts(nestedOrg, "results", "")
+  doAssert nestedResidual.contains("var nestedEmployees") and nestedResidual.contains("var nestedTasks")
+  doAssert nestedResidual.count("for ") >= 3
+  doAssert "materialize" notin nestedResidual
+  let nestedWrapped = concatList(nestedOrg, nestedOrg)
+  doAssert occurrences(nestedWrapped.node, cb).getOrDefault("field") == 0
+  doAssert occurrences(nestedWrapped.node, linqCallbacksOpen()).getOrDefault("field") > 0
   echo "ok: linq staged database comprehensions, normalization, effects, and residual execution"
