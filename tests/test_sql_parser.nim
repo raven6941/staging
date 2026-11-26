@@ -190,6 +190,7 @@ proc statement(p: var Parser): Operator =
       discard p.take
   if outNames.len > 0: result = project(outNames, result, inNames)
   if orderKeys.len > 0: result = orderBy(orderKeys, orderDirs, result)
+  if p.acceptWord("limit"): result = limit(parseInt(p.want(tkInt).text), result)
 
 proc parseSql*(sql: string; resolveTable: proc(ident: string): Operator): Operator =
   var p = Parser(input: sql, tokens: tokenize(sql), resolveTable: resolveTable)
@@ -227,6 +228,28 @@ when isMainModule:
   expectShape("select * from t.csv group by Name max Value", "Group(Name;max:Value;Scan(Name,Flag,Value))", resolve)
   expectShape("select * from t.csv group by Name sum Value, min Value", "Group(Name;sum:Value,min:Value;Scan(Name,Flag,Value))", resolve)
   expectShape("select * from t.csv order by Value desc", "Sort(Value:desc;Scan(Name,Flag,Value))", resolve)
+  expectShape("select * from t.csv limit 2", "Limit(2;Scan(Name,Flag,Value))", resolve)
+  let limited = parseSql("select * from t.csv limit 2", resolve)
+  doAssert "limitCount" in execOp(limited)
+  doAssert runStaged(limited) == directRows(limited).mapIt(it.join(","))
+  doAssert runStaged(limited) == @["Ada,yes,10", "Bob,no,20"]
+  let limitZero = parseSql("select * from t.csv limit 0", resolve)
+  doAssert runStaged(limitZero) == @[]
+  doAssert directRows(limitZero).len == 0
+  let limitLarge = parseSql("select * from t.csv limit 10", resolve)
+  doAssert runStaged(limitLarge) == directRows(limitLarge).mapIt(it.join(","))
+  doAssert runStaged(limitLarge) == @["Ada,yes,10", "Bob,no,20", "Ada,yes,7"]
+  let topN = parseSql("select * from t.csv order by Value desc limit 2", resolve)
+  expectShape("select * from t.csv order by Value desc limit 2", "Limit(2;Sort(Value:desc;Scan(Name,Flag,Value)))", resolve)
+  doAssert runStaged(topN) == directRows(topN).mapIt(it.join(","))
+  doAssert runStaged(topN) == @["Bob,no,20", "Ada,yes,10"]
+  let groupedLimit = parseSql("select * from t.csv group by Name sum Value limit 1", resolve)
+  doAssert runStaged(groupedLimit) == directRows(groupedLimit).mapIt(it.join(","))
+  doAssert runStaged(groupedLimit).len == 1
+  try:
+    discard parseSql("select * from t.csv limit nope", resolve)
+    doAssert false
+  except ParseError: discard
   doAssert runStaged(parseSql("select * from t.csv where Flag='yes'", resolve)) == @["Ada,yes,10", "Ada,yes,7"]
   # Load-bearing: the following assertion fails if the residual Lt branch is
   # stubbed out (verified by stubbing it once, observing the failure, restoring).

@@ -23,7 +23,7 @@ type
   NodeKind = enum nkInput, nkScanner, nkNext, nkNextInt, nkHasNext, nkClose,
     nkVarDecl, nkVarRead, nkVarWrite, nkSeq, nkWhile, nkIf, nkAdd, nkMul,
     nkEq, nkLt, nkAnd, nkOr, nkNot, nkStringLen, nkStringEq, nkStringLt, nkHash, nkMod, nkDiv, nkArrDecl,
-    nkArrRead, nkArrWrite, nkBufferLen, nkBufferAppend, nkBufferRead, nkPrint
+    nkArrRead, nkArrWrite, nkBufferLen, nkBufferAppend, nkBufferRead, nkPrint, nkDiscard
   QueryNode = ref object of IRNode
     kind: NodeKind
     name, text: string
@@ -77,7 +77,7 @@ type
     left*, right*: Ref
     a*, b*: Predicate
   AggKind* = enum akSum, akAvg, akMin, akMax
-  OpKind* = enum okScan, okFilter, okProject, okJoin, okHashJoin, okGroup, okSort, okPrintCSV
+  OpKind* = enum okScan, okFilter, okProject, okJoin, okHashJoin, okGroup, okSort, okLimit, okPrintCSV
   Operator* = ref object
     kind: OpKind
     csv, csvRight: string
@@ -85,6 +85,7 @@ type
     aggKinds: seq[AggKind]
     sortKeys: seq[string]
     sortDesc: seq[bool]
+    n: int
     delim: char
     predicate: Predicate
     parent, right: Operator
@@ -144,7 +145,7 @@ proc resultSchema*(q: Operator): seq[string] =
     for j, name in q.aggregates:
       aggregateNames.add(aggName(q.aggKinds[j]) & "_" & name)
     q.keys & @["count"] & aggregateNames
-  of okSort: resultSchema(q.parent)
+  of okSort, okLimit: resultSchema(q.parent)
 
 proc opShape*(q: Operator): string =
   ## A compact structural view used by the SQL front-end tests.
@@ -160,6 +161,7 @@ proc opShape*(q: Operator): string =
     "Group(" & q.keys.join(",") & ";" & aggregateShape.join(",") & ";" & opShape(q.parent) & ")"
   of okSort:
     "Sort(" & q.sortKeys.mapIt(it & ":" & (if q.sortDesc[q.sortKeys.find(it)]: "desc" else: "asc")).join(",") & ";" & opShape(q.parent) & ")"
+  of okLimit: "Limit(" & $q.n & ";" & opShape(q.parent) & ")"
   of okPrintCSV: "Print(" & opShape(q.parent) & ")"
 
 proc lookup(s: seq[string]; n: string): int =
@@ -169,6 +171,8 @@ proc orderBy*(keys: seq[string]; dirs: seq[bool]; q: Operator): Operator =
   let schema = resultSchema(q)
   for key in keys: discard lookup(schema, key)
   Operator(kind: okSort, sortKeys: keys, sortDesc: dirs, parent: q)
+proc limit*(n: int; q: Operator): Operator =
+  Operator(kind: okLimit, n: n, parent: q)
 
 proc parseRows*(csv: string; delim = ','): seq[seq[string]] =
   for line in csv.strip.splitLines[1 .. ^1]:
@@ -199,7 +203,7 @@ proc refKind(r: Ref; schema: seq[string]; kinds: seq[bool]): FieldKind =
 proc columnKinds(q: Operator): seq[bool] =
   case q.kind
   of okScan: result = sourceKinds(q.csv, q.schema, q.delim)
-  of okFilter, okPrintCSV, okSort: result = columnKinds(q.parent)
+  of okFilter, okPrintCSV, okSort, okLimit: result = columnKinds(q.parent)
   of okProject:
     let parentSchema = resultSchema(q.parent)
     let input = if q.inputSchema.len == 0: q.outputSchema else: q.inputSchema
@@ -311,6 +315,10 @@ proc directRows(q: Operator): seq[seq[string]] =
         result[j] = result[j - 1]
         dec j
       result[j] = row
+  of okLimit:
+    let parentRows = directRows(q.parent)
+    let count = min(max(q.n, 0), parentRows.len)
+    result = parentRows[0 ..< count]
   of okPrintCSV: result = directRows(q.parent)
 
 # Residual constructors.  In particular, Scanner position is a residual Var,
@@ -394,6 +402,8 @@ proc emitStmt(x: Rep[Unit]; ind=""): string =
   of nkVarWrite: ind & QueryNode(n.v.node).name & " = " & emitInt(n.value)
   of nkPrint:
     ind & "echo " & n.fields.mapIt(if it.kind == fkString: emitString(it.str.data) else: "$(" & emitInt(it.int.value) & ")").join(" & \",\" & ")
+  of nkDiscard:
+    n.fields.mapIt(ind & "discard " & (if it.kind == fkString: emitString(it.str.data) else: emitInt(it.int.value))).join("\n")
   of nkBufferAppend:
     let target = if n.svalue == nil: QueryNode(n.arr.node).name & "[" & emitInt(n.index) & "] = " & emitInt(n.value)
                  else: QueryNode(n.arrStr.node).name & "[" & emitInt(n.index) & "] = " & emitString(n.svalue)
@@ -447,7 +457,7 @@ proc execOpWith(q: Operator; emitRow: proc(f: seq[RField]): Rep[Unit];
   proc ltI(a,b: Rep[int]): Rep[bool] = dynamic[bool](QueryNode(kind:nkLt,boolLeft:a,boolRight:b))
   proc andB(a,b: Rep[bool]): Rep[bool] = dynamic[bool](QueryNode(kind:nkAnd,boolA:a,boolB:b))
   proc orB(a,b: Rep[bool]): Rep[bool] = dynamic[bool](QueryNode(kind:nkOr,boolA:a,boolB:b))
-  proc pr(xs: seq[RField]): Rep[Unit] = dynamic[Unit](QueryNode(kind:nkPrint,fields:xs))
+  proc discardFields(xs: seq[RField]): Rep[Unit] = dynamic[Unit](QueryNode(kind:nkDiscard,fields:xs))
   proc addMany(xs: seq[Rep[Unit]]): Rep[Unit] = seqMany(xs)
   proc stringCols(csv: string; schema: seq[string]): seq[bool] =
     let delim = if q.kind == okScan: q.delim else: q.parent.delim
@@ -480,7 +490,16 @@ proc execOpWith(q: Operator; emitRow: proc(f: seq[RField]): Rep[Unit];
     of pkAnd: result = andB(predicateRep(p.a, f, schema, kinds), predicateRep(p.b, f, schema, kinds))
     of pkOr: result = orB(predicateRep(p.a, f, schema, kinds), predicateRep(p.b, f, schema, kinds))
   var body: Rep[Unit]
-  if q.kind == okSort:
+  if q.kind == okLimit:
+    let count = iv("limitCount")
+    proc wrappedEmitRow(f: seq[RField]): Rep[Unit] =
+      ifB(ltI(vr(count), staticInt(q.n)),
+        proc(): Rep[Unit] = seqs(emitRow(f), vw(count, intAdd(vr(count), staticInt(1)))),
+        proc(): Rep[Unit] = discardFields(f))
+    var parentBody: Rep[Unit]
+    discard execOpWith(q.parent, wrappedEmitRow, vars, ints, strings, parentBody, false)
+    body = parentBody
+  elif q.kind == okSort:
     let schema = resultSchema(q.parent)
     let kinds = columnKinds(q.parent)
     var outS: seq[Arr[string]] = @[]
@@ -532,7 +551,7 @@ proc execOpWith(q: Operator; emitRow: proc(f: seq[RField]): Rep[Unit];
       for i, isString in kinds:
         if isString: fields.add(RField(kind:fkString,str:RString(data:sr(outS[i],ar(order,vr(pos))))))
         else: fields.add(RField(kind:fkInt,int:RInt(value:ar(outI[i],ar(order,vr(pos))))))
-      seqs(pr(fields),vw(pos,intAdd(vr(pos),staticInt(1)))))
+      seqs(emitRow(fields),vw(pos,intAdd(vr(pos),staticInt(1)))))
     body = seqs(parentBody, seqs(initOrder, seqs(vw(scanPos,staticInt(1)), seqs(sortLoop, seqs(vw(pos,staticInt(0)),outLoop)))))
   elif q.kind == okGroup:
     let schema = resultSchema(q.parent)
