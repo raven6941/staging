@@ -22,7 +22,7 @@ type
 
   NodeKind = enum nkInput, nkScanner, nkNext, nkNextInt, nkHasNext, nkClose,
     nkVarDecl, nkVarRead, nkVarWrite, nkSeq, nkWhile, nkIf, nkAdd, nkMul,
-    nkEq, nkLt, nkAnd, nkOr, nkNot, nkStringLen, nkStringEq, nkStringLt, nkHash, nkMod, nkDiv, nkArrDecl,
+    nkEq, nkLt, nkLe, nkGe, nkAnd, nkOr, nkNot, nkStringLen, nkStringEq, nkStringLt, nkStringLe, nkStringGe, nkHash, nkMod, nkDiv, nkArrDecl,
     nkArrRead, nkArrWrite, nkBufferLen, nkBufferAppend, nkBufferRead, nkPrint, nkDiscard
   QueryNode = ref object of IRNode
     kind: NodeKind
@@ -71,13 +71,13 @@ type
     kind: RefKind
     name: string
     value: RField
-  PredicateKind* = enum pkEquals, pkLessThan, pkAnd, pkOr
+  PredicateKind* = enum pkEquals, pkLessThan, pkGreaterThan, pkLessEq, pkGreaterEq, pkAnd, pkOr
   Predicate* = ref object
     kind*: PredicateKind
     left*, right*: Ref
     a*, b*: Predicate
   AggKind* = enum akSum, akAvg, akMin, akMax
-  OpKind* = enum okScan, okFilter, okProject, okJoin, okHashJoin, okGroup, okSort, okLimit, okOffset, okPrintCSV
+  OpKind* = enum okScan, okFilter, okProject, okJoin, okHashJoin, okGroup, okSort, okLimit, okOffset, okHaving, okPrintCSV
   Operator* = ref object
     kind: OpKind
     csv, csvRight: string
@@ -131,6 +131,9 @@ proc aggName*(kind: AggKind): string =
 proc printCSV(q: Operator): Operator = Operator(kind: okPrintCSV, parent: q)
 proc equals*(a, b: Ref): Predicate = Predicate(kind: pkEquals, left: a, right: b)
 proc lessThan*(a, b: Ref): Predicate = Predicate(kind: pkLessThan, left: a, right: b)
+proc greaterThan*(a, b: Ref): Predicate = Predicate(kind: pkGreaterThan, left: a, right: b)
+proc lessEq*(a, b: Ref): Predicate = Predicate(kind: pkLessEq, left: a, right: b)
+proc greaterEq*(a, b: Ref): Predicate = Predicate(kind: pkGreaterEq, left: a, right: b)
 proc predAnd*(a, b: Predicate): Predicate = Predicate(kind: pkAnd, a: a, b: b)
 proc predOr*(a, b: Predicate): Predicate = Predicate(kind: pkOr, a: a, b: b)
 
@@ -145,7 +148,21 @@ proc resultSchema*(q: Operator): seq[string] =
     for j, name in q.aggregates:
       aggregateNames.add(aggName(q.aggKinds[j]) & "_" & name)
     q.keys & @["count"] & aggregateNames
-  of okSort, okLimit, okOffset: resultSchema(q.parent)
+  of okSort, okLimit, okOffset, okHaving: resultSchema(q.parent)
+
+proc predShape(p: Predicate): string =
+  proc refShape(r: Ref): string =
+    if r.kind == rkField: r.name
+    elif r.value.kind == fkString: "'" & r.value.str.data.staticVal & "'"
+    else: $r.value.int.value.staticVal
+  case p.kind
+  of pkEquals: refShape(p.left) & "=" & refShape(p.right)
+  of pkLessThan: refShape(p.left) & "<" & refShape(p.right)
+  of pkGreaterThan: refShape(p.left) & ">" & refShape(p.right)
+  of pkLessEq: refShape(p.left) & "<=" & refShape(p.right)
+  of pkGreaterEq: refShape(p.left) & ">=" & refShape(p.right)
+  of pkAnd: predShape(p.a) & " and " & predShape(p.b)
+  of pkOr: predShape(p.a) & " or " & predShape(p.b)
 
 proc opShape*(q: Operator): string =
   ## A compact structural view used by the SQL front-end tests.
@@ -163,6 +180,7 @@ proc opShape*(q: Operator): string =
     "Sort(" & q.sortKeys.mapIt(it & ":" & (if q.sortDesc[q.sortKeys.find(it)]: "desc" else: "asc")).join(",") & ";" & opShape(q.parent) & ")"
   of okLimit: "Limit(" & $q.n & ";" & opShape(q.parent) & ")"
   of okOffset: "Offset(" & $q.n & ";" & opShape(q.parent) & ")"
+  of okHaving: "Having(" & predShape(q.predicate) & ";" & opShape(q.parent) & ")"
   of okPrintCSV: "Print(" & opShape(q.parent) & ")"
 
 proc lookup(s: seq[string]; n: string): int =
@@ -176,6 +194,8 @@ proc limit*(n: int; q: Operator): Operator =
   Operator(kind: okLimit, n: n, parent: q)
 proc offset*(m: int; q: Operator): Operator =
   Operator(kind: okOffset, n: m, parent: q)
+proc having*(pred: Predicate; q: Operator): Operator =
+  Operator(kind: okHaving, predicate: pred, parent: q)
 
 proc parseRows*(csv: string; delim = ','): seq[seq[string]] =
   for line in csv.strip.splitLines[1 .. ^1]:
@@ -203,10 +223,49 @@ proc refKind(r: Ref; schema: seq[string]; kinds: seq[bool]): FieldKind =
     if kinds[lookup(schema, r.name)]: fkString else: fkInt
   else: r.value.kind
 
+proc predicateMatches(p: Predicate; row: seq[string]; schema: seq[string]; kinds: seq[bool]): bool =
+  case p.kind
+  of pkEquals, pkLessThan, pkGreaterThan, pkLessEq, pkGreaterEq:
+    let aKind = refKind(p.left, schema, kinds)
+    let bKind = refKind(p.right, schema, kinds)
+    doAssert aKind == bKind, "predicate kind mismatch"
+    let a = refText(p.left, row, schema)
+    let b = refText(p.right, row, schema)
+    if p.kind == pkEquals: result = a == b
+    elif aKind == fkString:
+      result = case p.kind
+        of pkLessThan: a < b
+        of pkGreaterThan: a > b
+        of pkLessEq: a <= b
+        of pkGreaterEq: a >= b
+        else: false
+    else:
+      let ai = parseInt(a); let bi = parseInt(b)
+      result = case p.kind
+        of pkLessThan: ai < bi
+        of pkGreaterThan: ai > bi
+        of pkLessEq: ai <= bi
+        of pkGreaterEq: ai >= bi
+        else: false
+  of pkAnd: result = predicateMatches(p.a, row, schema, kinds) and predicateMatches(p.b, row, schema, kinds)
+  of pkOr: result = predicateMatches(p.a, row, schema, kinds) or predicateMatches(p.b, row, schema, kinds)
+
+proc validateHaving(p: Predicate; q: Operator) =
+  doAssert q.kind == okGroup, "HAVING requires GROUP BY"
+  var allowed = @["count"]
+  for j, name in q.aggregates: allowed.add(aggName(q.aggKinds[j]) & "_" & name)
+  proc validate(x: Predicate) =
+    case x.kind
+    of pkAnd, pkOr: validate(x.a); validate(x.b)
+    else:
+      for r in [x.left, x.right]:
+        if r.kind == rkField:
+          doAssert r.name in allowed, "HAVING field must be an aggregate output: " & r.name
+
 proc columnKinds(q: Operator): seq[bool] =
   case q.kind
   of okScan: result = sourceKinds(q.csv, q.schema, q.delim)
-  of okFilter, okPrintCSV, okSort, okLimit, okOffset: result = columnKinds(q.parent)
+  of okFilter, okPrintCSV, okSort, okLimit, okOffset, okHaving: result = columnKinds(q.parent)
   of okProject:
     let parentSchema = resultSchema(q.parent)
     let input = if q.inputSchema.len == 0: q.outputSchema else: q.inputSchema
@@ -227,22 +286,8 @@ proc directRows(q: Operator): seq[seq[string]] =
   of okFilter:
     let ps = resultSchema(q.parent)
     let kinds = columnKinds(q.parent)
-    proc matches(p: Predicate; row: seq[string]): bool =
-      case p.kind
-      of pkEquals, pkLessThan:
-        let aKind = refKind(p.left, ps, kinds)
-        let bKind = refKind(p.right, ps, kinds)
-        doAssert aKind == bKind, "predicate kind mismatch"
-        if p.kind == pkEquals:
-          result = refText(p.left, row, ps) == refText(p.right, row, ps)
-        elif aKind == fkString:
-          result = refText(p.left, row, ps) < refText(p.right, row, ps)
-        else:
-          result = parseInt(refText(p.left, row, ps)) < parseInt(refText(p.right, row, ps))
-      of pkAnd: result = matches(p.a, row) and matches(p.b, row)
-      of pkOr: result = matches(p.a, row) or matches(p.b, row)
     for row in directRows(q.parent):
-      if matches(q.predicate, row): result.add(row)
+      if predicateMatches(q.predicate, row, ps, kinds): result.add(row)
   of okProject:
     let ps = resultSchema(q.parent)
     let ins = if q.inputSchema.len == 0: q.outputSchema else: q.inputSchema
@@ -326,6 +371,11 @@ proc directRows(q: Operator): seq[seq[string]] =
     let parentRows = directRows(q.parent)
     let start = min(max(q.n, 0), parentRows.len)
     result = parentRows[start ..< parentRows.len]
+  of okHaving:
+    validateHaving(q.predicate, q.parent)
+    let ps = resultSchema(q.parent); let kinds = columnKinds(q.parent)
+    for row in directRows(q.parent):
+      if predicateMatches(q.predicate, row, ps, kinds): result.add(row)
   of okPrintCSV: result = directRows(q.parent)
 
 # Residual constructors.  In particular, Scanner position is a residual Var,
@@ -350,6 +400,10 @@ proc stringCompare(a, b: RString): Rep[bool] =
   dynamic[bool](QueryNode(kind: nkStringEq, sleft: a.data, sright: b.data))
 proc stringLess(a, b: RString): Rep[bool] =
   dynamic[bool](QueryNode(kind: nkStringLt, sleft: a.data, sright: b.data))
+proc stringLessEq(a, b: RString): Rep[bool] =
+  dynamic[bool](QueryNode(kind: nkStringLe, sleft: a.data, sright: b.data))
+proc stringGreaterEq(a, b: RString): Rep[bool] =
+  dynamic[bool](QueryNode(kind: nkStringGe, sleft: a.data, sright: b.data))
 proc fieldHash(a: RString): Rep[int] =
   dynamic[int](QueryNode(kind: nkHash, sleft: a.data))
 proc intAdd(a, b: Rep[int]): Rep[int] = smartOp[int](a, b, proc(x,y:int):int=x+y, proc(x,y:Rep[int]):IRNode=QueryNode(kind:nkAdd,left:x,right:y))
@@ -392,8 +446,12 @@ proc emitBool(x: Rep[bool]): string =
   if n.kind == nkHasNext: QueryNode(n.pos.node).name & " < " & escape(n.text) & ".len"
   elif n.kind == nkStringEq: "compareStringChars(" & emitString(n.sleft) & ", " & emitString(n.sright) & ")"
   elif n.kind == nkStringLt: "compareStringLt(" & emitString(n.sleft) & ", " & emitString(n.sright) & ")"
+  elif n.kind == nkStringLe: "compareStringLe(" & emitString(n.sleft) & ", " & emitString(n.sright) & ")"
+  elif n.kind == nkStringGe: "compareStringGe(" & emitString(n.sleft) & ", " & emitString(n.sright) & ")"
   elif n.kind == nkEq: "(" & emitInt(n.boolLeft) & " == " & emitInt(n.boolRight) & ")"
   elif n.kind == nkLt: "(" & emitInt(n.boolLeft) & " < " & emitInt(n.boolRight) & ")"
+  elif n.kind == nkLe: "(" & emitInt(n.boolLeft) & " <= " & emitInt(n.boolRight) & ")"
+  elif n.kind == nkGe: "(" & emitInt(n.boolLeft) & " >= " & emitInt(n.boolRight) & ")"
   elif n.kind == nkAnd: "(" & emitBool(n.boolA) & " and " & emitBool(n.boolB) & ")"
   elif n.kind == nkOr: "(" & emitBool(n.boolA) & " or " & emitBool(n.boolB) & ")"
   else: raise newException(ValueError, "bad residual bool")
@@ -462,6 +520,8 @@ proc execOpWith(q: Operator; emitRow: proc(f: seq[RField]): Rep[Unit];
   proc sw(a: Arr[string]; i:Rep[int]; x:Rep[string]): Rep[Unit] = writeArr(a,i,x,proc(z:Arr[string];j:Rep[int];k:Rep[string]):IRNode=QueryNode(kind:nkArrWrite,arrStr:z,index:j,svalue:k))
   proc eqI(a,b: Rep[int]): Rep[bool] = dynamic[bool](QueryNode(kind:nkEq,boolLeft:a,boolRight:b))
   proc ltI(a,b: Rep[int]): Rep[bool] = dynamic[bool](QueryNode(kind:nkLt,boolLeft:a,boolRight:b))
+  proc leI(a,b: Rep[int]): Rep[bool] = dynamic[bool](QueryNode(kind:nkLe,boolLeft:a,boolRight:b))
+  proc geI(a,b: Rep[int]): Rep[bool] = dynamic[bool](QueryNode(kind:nkGe,boolLeft:a,boolRight:b))
   proc andB(a,b: Rep[bool]): Rep[bool] = dynamic[bool](QueryNode(kind:nkAnd,boolA:a,boolB:b))
   proc orB(a,b: Rep[bool]): Rep[bool] = dynamic[bool](QueryNode(kind:nkOr,boolA:a,boolB:b))
   proc discardFields(xs: seq[RField]): Rep[Unit] = dynamic[Unit](QueryNode(kind:nkDiscard,fields:xs))
@@ -485,7 +545,7 @@ proc execOpWith(q: Operator; emitRow: proc(f: seq[RField]): Rep[Unit];
       if x in b: result.add(x)
   proc predicateRep(p: Predicate; f: seq[RField]; schema: seq[string]; kinds: seq[bool]): Rep[bool] =
     case p.kind
-    of pkEquals, pkLessThan:
+    of pkEquals, pkLessThan, pkGreaterThan, pkLessEq, pkGreaterEq:
       var a, b: RField
       if p.left.kind == rkField: a = f[lookup(schema, p.left.name)] else: a = p.left.value
       if p.right.kind == rkField: b = f[lookup(schema, p.right.name)] else: b = p.right.value
@@ -493,7 +553,20 @@ proc execOpWith(q: Operator; emitRow: proc(f: seq[RField]): Rep[Unit];
       if p.kind == pkEquals:
         result = if a.kind == fkString: stringCompare(a.str, b.str) else: eqI(a.int.value, b.int.value)
       else:
-        result = if a.kind == fkString: stringLess(a.str, b.str) else: ltI(a.int.value, b.int.value)
+        result = if a.kind == fkString:
+          case p.kind
+          of pkLessThan: stringLess(a.str, b.str)
+          of pkGreaterThan: stringLess(b.str, a.str)
+          of pkLessEq: stringLessEq(a.str, b.str)
+          of pkGreaterEq: stringGreaterEq(a.str, b.str)
+          else: liftNow(false)
+        else:
+          case p.kind
+          of pkLessThan: ltI(a.int.value, b.int.value)
+          of pkGreaterThan: ltI(b.int.value, a.int.value)
+          of pkLessEq: leI(a.int.value, b.int.value)
+          of pkGreaterEq: geI(a.int.value, b.int.value)
+          else: liftNow(false)
     of pkAnd: result = andB(predicateRep(p.a, f, schema, kinds), predicateRep(p.b, f, schema, kinds))
     of pkOr: result = orB(predicateRep(p.a, f, schema, kinds), predicateRep(p.b, f, schema, kinds))
   var body: Rep[Unit]
@@ -512,6 +585,16 @@ proc execOpWith(q: Operator; emitRow: proc(f: seq[RField]): Rep[Unit];
       ifB(ltI(vr(count), staticInt(q.n)),
         proc(): Rep[Unit] = seqs(discardFields(f), vw(count, intAdd(vr(count), staticInt(1)))),
         proc(): Rep[Unit] = emitRow(f))
+    var parentBody: Rep[Unit]
+    discard execOpWith(q.parent, wrappedEmitRow, vars, ints, strings, parentBody, false)
+    body = parentBody
+  elif q.kind == okHaving:
+    validateHaving(q.predicate, q.parent)
+    let schema = resultSchema(q.parent)
+    let kinds = columnKinds(q.parent)
+    proc wrappedEmitRow(f: seq[RField]): Rep[Unit] =
+      let holds = predicateRep(q.predicate, f, schema, kinds)
+      ifB(holds, proc(): Rep[Unit] = emitRow(f), proc(): Rep[Unit] = discardFields(f))
     var parentBody: Rep[Unit]
     discard execOpWith(q.parent, wrappedEmitRow, vars, ints, strings, parentBody, false)
     body = parentBody
@@ -837,7 +920,7 @@ proc execOpWith(q: Operator; emitRow: proc(f: seq[RField]): Rep[Unit];
   sharedInts = ints
   sharedStrings = strings
   if not root: return ""
-  result = result.replace("proc hashString(a: string): int =", "proc compareStringLt(a,b: string): bool =\n  var i = 0\n  while i < a.len and i < b.len and a[i] == b[i]: inc i\n  if i == a.len or i == b.len: return a.len < b.len\n  result = a[i] < b[i]\n\nproc hashString(a: string): int =")
+  result = result.replace("proc hashString(a: string): int =", "proc compareStringLt(a,b: string): bool =\n  var i = 0\n  while i < a.len and i < b.len and a[i] == b[i]: inc i\n  if i == a.len or i == b.len: return a.len < b.len\n  result = a[i] < b[i]\n\nproc compareStringLe(a,b: string): bool = compareStringLt(a,b) or compareStringChars(a,b)\nproc compareStringGe(a,b: string): bool = compareStringLt(b,a) or compareStringChars(a,b)\n\nproc hashString(a: string): int =")
   for a in strings: result.add(emitDecl(a) & "\n")
   for a in ints: result.add(emitDecl(a) & "\n")
   for v in vars: result.add(emitDecl(v) & "\n")
