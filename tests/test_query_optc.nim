@@ -71,7 +71,7 @@ type
     kind*: RefKind
     name: string
     value: RField
-  PredicateKind* = enum pkEquals, pkLessThan, pkGreaterThan, pkLessEq, pkGreaterEq, pkAnd, pkOr, pkIn
+  PredicateKind* = enum pkEquals, pkLessThan, pkGreaterThan, pkLessEq, pkGreaterEq, pkAnd, pkOr, pkIn, pkNotIn
   Predicate* = ref object
     kind*: PredicateKind
     left*, right*: Ref
@@ -139,6 +139,8 @@ proc predAnd*(a, b: Predicate): Predicate = Predicate(kind: pkAnd, a: a, b: b)
 proc predOr*(a, b: Predicate): Predicate = Predicate(kind: pkOr, a: a, b: b)
 proc inSubquery*(fieldRef: Ref; sub: Operator): Predicate =
   Predicate(kind: pkIn, left: fieldRef, subquery: sub)
+proc notInSubquery*(fieldRef: Ref; sub: Operator): Predicate =
+  Predicate(kind: pkNotIn, left: fieldRef, subquery: sub)
 
 proc opShape*(q: Operator): string
 
@@ -169,13 +171,14 @@ proc predShape(p: Predicate): string =
   of pkAnd: predShape(p.a) & " and " & predShape(p.b)
   of pkOr: predShape(p.a) & " or " & predShape(p.b)
   of pkIn: "In(" & refShape(p.left) & ";" & opShape(p.subquery) & ")"
+  of pkNotIn: "NotIn(" & refShape(p.left) & ";" & opShape(p.subquery) & ")"
 
 proc opShape*(q: Operator): string =
   ## A compact structural view used by the SQL front-end tests.
   case q.kind
   of okScan: "Scan(" & q.schema.join(",") & ")"
   of okFilter:
-    if q.predicate.kind == pkIn: "Filter(" & predShape(q.predicate) & ";" & opShape(q.parent) & ")"
+    if q.predicate.kind in {pkIn, pkNotIn}: "Filter(" & predShape(q.predicate) & ";" & opShape(q.parent) & ")"
     else: "Filter(" & opShape(q.parent) & ")"
   of okProject: "Project(" & q.outputSchema.join(",") & ";" & q.inputSchema.join(",") & ";" & opShape(q.parent) & ")"
   of okJoin: "Join(" & opShape(q.parent) & ";" & opShape(q.right) & ")"
@@ -275,6 +278,16 @@ proc predicateMatches(p: Predicate; row: seq[string]; schema: seq[string]; kinds
     for subRow in directRows(p.subquery):
       if subRow.len > 0 and subRow[0] == needle: return true
     result = false
+  of pkNotIn:
+    doAssert p.left.kind == rkField, "NOT IN left operand must be a field"
+    let leftKind = refKind(p.left, schema, kinds)
+    let subKinds = columnKinds(p.subquery)
+    doAssert subKinds.len > 0, "NOT IN subquery must have a column"
+    doAssert leftKind == (if subKinds[0]: fkString else: fkInt), "predicate kind mismatch"
+    let needle = refText(p.left, row, schema)
+    result = true
+    for subRow in directRows(p.subquery):
+      if subRow.len > 0 and subRow[0] == needle: return false
 
 proc validateHaving(p: Predicate; q: Operator) =
   doAssert q.kind == okGroup, "HAVING requires GROUP BY"
@@ -283,7 +296,7 @@ proc validateHaving(p: Predicate; q: Operator) =
   proc validate(x: Predicate) =
     case x.kind
     of pkAnd, pkOr: validate(x.a); validate(x.b)
-    of pkIn: doAssert false, "IN is not allowed in HAVING"
+    of pkIn, pkNotIn: doAssert false, "IN is not allowed in HAVING"
     else:
       for r in [x.left, x.right]:
         if r.kind == rkField:
@@ -484,6 +497,7 @@ proc emitBool(x: Rep[bool]): string =
   elif n.kind == nkGe: "(" & emitInt(n.boolLeft) & " >= " & emitInt(n.boolRight) & ")"
   elif n.kind == nkAnd: "(" & emitBool(n.boolA) & " and " & emitBool(n.boolB) & ")"
   elif n.kind == nkOr: "(" & emitBool(n.boolA) & " or " & emitBool(n.boolB) & ")"
+  elif n.kind == nkNot: "not (" & emitBool(n.boolA) & ")"
   elif n.kind == nkInProbe:
     let f = n.fields[0]
     let used = QueryNode(n.v.node).name
@@ -540,15 +554,18 @@ proc execOpWith(q: Operator; emitRow: proc(f: seq[RField]): Rep[Unit];
   ## here is choosing typed columns from the CSV fixture; all scanning,
   ## hashing, probing, buffering, and output are Rep nodes.
   let cap = 256
+  var opSerial {.global.}: int
+  let opSuffix = if opSerial == 0: "" else: "_" & $opSerial
+  inc opSerial
   var vars = sharedVars
   var ints = sharedInts
   var strings = sharedStrings
   proc iv(name: string; x = 0): Var[int] =
-    result = newVar(staticInt(x), proc(v: Rep[int]): IRNode = QueryNode(kind:nkVarDecl,name:name,init:v)); vars.add(result)
+    result = newVar(staticInt(x), proc(v: Rep[int]): IRNode = QueryNode(kind:nkVarDecl,name:name & opSuffix,init:v)); vars.add(result)
   proc ia(name: string; size = cap): Arr[int] =
-    result = newArray[int](staticInt(size), proc(v: Rep[int]): IRNode = QueryNode(kind:nkArrDecl,name:name,init:v)); ints.add(result)
+    result = newArray[int](staticInt(size), proc(v: Rep[int]): IRNode = QueryNode(kind:nkArrDecl,name:name & opSuffix,init:v)); ints.add(result)
   proc sa(name: string): Arr[string] =
-    result = newArray[string](staticInt(cap), proc(v: Rep[int]): IRNode = QueryNode(kind:nkArrDecl,name:name,init:v)); strings.add(result)
+    result = newArray[string](staticInt(cap), proc(v: Rep[int]): IRNode = QueryNode(kind:nkArrDecl,name:name & opSuffix,init:v)); strings.add(result)
   proc vr(v: Var[int]): Rep[int] = readVar(v, proc(x: Var[int]): IRNode = QueryNode(kind:nkVarRead,v:x))
   proc vw(v: Var[int]; x: Rep[int]): Rep[Unit] = writeVar(v,x,proc(a:Var[int]; b:Rep[int]):IRNode=QueryNode(kind:nkVarWrite,v:a,value:b))
   proc ar(a: Arr[int]; i: Rep[int]): Rep[int] = readArr(a,i,proc(x:Arr[int]; y:Rep[int]):IRNode=QueryNode(kind:nkArrRead,arr:x,index:y))
@@ -620,6 +637,18 @@ proc execOpWith(q: Operator; emitRow: proc(f: seq[RField]): Rep[Unit];
       else:
         doAssert inI[j] != nil, "predicate kind mismatch"
         result = dynamic[bool](QueryNode(kind: nkInProbe, arr: inI[j], v: inUsed[j], fields: @[field]))
+    of pkNotIn:
+      let j = inPreds.find(p)
+      doAssert j >= 0
+      let field = f[lookup(schema, p.left.name)]
+      var probe: Rep[bool]
+      if field.kind == fkString:
+        doAssert inS[j] != nil, "predicate kind mismatch"
+        probe = dynamic[bool](QueryNode(kind: nkInProbe, arrStr: inS[j], v: inUsed[j], fields: @[field]))
+      else:
+        doAssert inI[j] != nil, "predicate kind mismatch"
+        probe = dynamic[bool](QueryNode(kind: nkInProbe, arr: inI[j], v: inUsed[j], fields: @[field]))
+      result = dynamic[bool](QueryNode(kind: nkNot, boolA: probe))
   var body: Rep[Unit]
   if q.kind == okLimit:
     let count = iv("limitCount")
@@ -875,7 +904,8 @@ proc execOpWith(q: Operator; emitRow: proc(f: seq[RField]): Rep[Unit];
             else: xs.add(aw(outAgg,intAdd(intMul(vr(used),staticInt(q.aggregates.len)),staticInt(j)),ar(inputAgg[j],vr(inputPos))))
           xs.add(vw(used,intAdd(vr(used),staticInt(1)))); addMany(xs))
       updates.add(update); updates.add(vw(inputPos,intAdd(vr(inputPos),staticInt(1)))); addMany(updates)
-    let consumeAll = scanRows(q.parent.csv, schema, stringKinds, q.parent.delim, consume)
+    var consumeAll: Rep[Unit]
+    discard execOpWith(q.parent, consume, vars, ints, strings, consumeAll, false)
     var output: seq[Rep[Unit]] = @[]
     let outLoop = whileLoop(proc():Rep[bool]=ltI(vr(outPos),vr(used)), proc():Rep[Unit]=
       var fs: seq[RField] = @[]
@@ -950,12 +980,12 @@ proc execOpWith(q: Operator; emitRow: proc(f: seq[RField]): Rep[Unit];
     proc collectIn(p: Predicate) =
       case p.kind
       of pkAnd, pkOr: collectIn(p.a); collectIn(p.b)
-      of pkIn: inPreds.add(p)
+      of pkIn, pkNotIn: inPreds.add(p)
       else: discard
     collectIn(q.predicate)
     var fillBodies: seq[Rep[Unit]] = @[]
     for j, pred in inPreds:
-      doAssert pred.left.kind == rkField, "IN left operand must be a field"
+      doAssert pred.left.kind == rkField, "IN/NOT IN left operand must be a field"
       let leftKind = refKind(pred.left, schema, kinds)
       let subKinds = columnKinds(pred.subquery)
       doAssert subKinds.len > 0, "IN subquery must have a column"
@@ -1016,7 +1046,7 @@ proc execOpWith(q: Operator; emitRow: proc(f: seq[RField]): Rep[Unit];
       proc collectIn(p: Predicate) =
         case p.kind
         of pkAnd, pkOr: collectIn(p.a); collectIn(p.b)
-        of pkIn: inPreds.add(p)
+        of pkIn, pkNotIn: inPreds.add(p)
         else: discard
       collectIn(pred)
       for j, inPred in inPreds:
