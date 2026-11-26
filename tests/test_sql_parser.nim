@@ -3,7 +3,7 @@ import test_query_optc
 
 type
   TokenKind = enum tkEof, tkWord, tkInt, tkString, tkBad, tkStar, tkComma, tkLParen,
-    tkRParen, tkEquals, tkLess, tkDelim
+    tkRParen, tkEquals, tkLess, tkGreater, tkLessEq, tkGreaterEq, tkDelim
   Token = object
     kind: TokenKind
     text: string
@@ -41,7 +41,12 @@ proc tokenize(s: string): seq[Token] =
     of '(' : addToken(result, tkLParen, "(", i); inc i
     of ')' : addToken(result, tkRParen, ")", i); inc i
     of '=' : addToken(result, tkEquals, "=", i); inc i
-    of '<' : addToken(result, tkLess, "<", i); inc i
+    of '<':
+      if i + 1 < s.len and s[i + 1] == '=': addToken(result, tkLessEq, "<=", i); i += 2
+      else: addToken(result, tkLess, "<", i); inc i
+    of '>':
+      if i + 1 < s.len and s[i + 1] == '=': addToken(result, tkGreaterEq, ">=", i); i += 2
+      else: addToken(result, tkGreater, ">", i); inc i
     of '*': addToken(result, tkStar, "*", i); inc i
     of '\'':
       inc i
@@ -59,7 +64,7 @@ proc tokenize(s: string): seq[Token] =
         while i < s.len and s[i].isDigit: inc i
         addToken(result, tkInt, s[at ..< i], at)
       else:
-        while i < s.len and s[i] notin {' ', '\t', '\n', '\r', ',', '(', ')', '=', '<', '*', '\'', '\\'}: inc i
+        while i < s.len and s[i] notin {' ', '\t', '\n', '\r', ',', '(', ')', '=', '<', '>', '*', '\'', '\\'}: inc i
         addToken(result, tkWord, s[at ..< i], at)
   result.add(Token(kind: tkEof, offset: s.len))
 
@@ -123,7 +128,13 @@ proc comparison(p: var Parser): Predicate =
     discard p.take; result = equals(a, p.refValue)
   elif p.current.kind == tkLess:
     discard p.take; result = lessThan(a, p.refValue)
-  else: raise p.parseError(p.current, "= or <")
+  elif p.current.kind == tkGreater:
+    discard p.take; result = greaterThan(a, p.refValue)
+  elif p.current.kind == tkLessEq:
+    discard p.take; result = lessEq(a, p.refValue)
+  elif p.current.kind == tkGreaterEq:
+    discard p.take; result = greaterEq(a, p.refValue)
+  else: raise p.parseError(p.current, "=, <, >, <=, or >=")
 
 proc andExpression(p: var Parser): Predicate =
   result = p.comparison
@@ -176,6 +187,8 @@ proc statement(p: var Parser): Operator =
         kinds.add(kinds[^1])
       aggs.add(p.want(tkWord).text)
     result = groupKinds(keys, aggs, result, kinds)
+  if p.acceptWord("having"):
+    result = having(p.predicateExpression, result)
   var orderKeys: seq[string] = @[]
   var orderDirs: seq[bool] = @[]
   if p.acceptWord("order"):
@@ -237,6 +250,7 @@ when isMainModule:
   expectShape("select * from t.csv group by Name avg Value", "Group(Name;avg:Value;Scan(Name,Flag,Value))", resolve)
   expectShape("select * from t.csv group by Name min Value", "Group(Name;min:Value;Scan(Name,Flag,Value))", resolve)
   expectShape("select * from t.csv group by Name max Value", "Group(Name;max:Value;Scan(Name,Flag,Value))", resolve)
+  expectShape("select * from t.csv group by Name sum Value having sum_Value > 10", "Having(sum_Value>10;Group(Name;sum:Value;Scan(Name,Flag,Value)))", resolve)
   expectShape("select * from t.csv group by Name sum Value, min Value", "Group(Name;sum:Value,min:Value;Scan(Name,Flag,Value))", resolve)
   expectShape("select * from t.csv order by Value desc", "Sort(Value:desc;Scan(Name,Flag,Value))", resolve)
   expectShape("select * from t.csv limit 2", "Limit(2;Scan(Name,Flag,Value))", resolve)
@@ -285,6 +299,9 @@ when isMainModule:
     doAssert false
   except ParseError: discard
   doAssert runStaged(parseSql("select * from t.csv where Flag='yes'", resolve)) == @["Ada,yes,10", "Ada,yes,7"]
+  doAssert runStaged(parseSql("select * from t.csv where Value>10", resolve)) == @["Bob,no,20"]
+  doAssert runStaged(parseSql("select * from t.csv where Value<=10", resolve)) == @["Ada,yes,10", "Ada,yes,7"]
+  doAssert runStaged(parseSql("select * from t.csv where Value>=20", resolve)) == @["Bob,no,20"]
   # Load-bearing: the following assertion fails if the residual Lt branch is
   # stubbed out (verified by stubbing it once, observing the failure, restoring).
   doAssert runStaged(parseSql("select * from t.csv where Value<10", resolve)) == @["Ada,yes,7"]
@@ -293,6 +310,35 @@ when isMainModule:
   doAssert directRows(parseSql("select * from t.csv where Name<'Bob'", resolve)) == @[@["Ada", "yes", "10"], @["Ada", "yes", "7"]]
   doAssert runStaged(parseSql("select Name as Name1 from t.csv where Name='Ada' and Value=7", resolve)) == @["Ada"]
   doAssert runStaged(parseSql("select * from t.csv where Name='Ada' or Flag='no'", resolve)) == @["Ada,yes,10", "Bob,no,20", "Ada,yes,7"]
+  let havingGt = parseSql("select * from t.csv group by Name sum Value having sum_Value > 10", resolve)
+  doAssert runStaged(havingGt) == directRows(havingGt).mapIt(it.join(","))
+  doAssert runStaged(havingGt) == @["Ada,2,17", "Bob,1,20"]
+  let havingCount = parseSql("select * from t.csv group by Name sum Value having count >= 2", resolve)
+  doAssert runStaged(havingCount) == directRows(havingCount).mapIt(it.join(","))
+  doAssert runStaged(havingCount) == @["Ada,2,17"]
+  let havingNone = parseSql("select * from t.csv group by Name sum Value having sum_Value > 100", resolve)
+  doAssert runStaged(havingNone) == directRows(havingNone).mapIt(it.join(","))
+  doAssert runStaged(havingNone) == @[]
+  let havingLimit = parseSql("select * from t.csv group by Name sum Value having sum_Value > 10 limit 1", resolve)
+  doAssert runStaged(havingLimit) == directRows(havingLimit).mapIt(it.join(","))
+  doAssert runStaged(havingLimit).len == 1
+  let havingOffset = parseSql("select * from t.csv group by Name sum Value having sum_Value > 10 offset 1", resolve)
+  doAssert runStaged(havingOffset) == directRows(havingOffset).mapIt(it.join(","))
+  doAssert runStaged(havingOffset) == @["Bob,1,20"]
+  let havingOrder = parseSql("select * from t.csv group by Name sum Value having sum_Value > 10 order by sum_Value desc", resolve)
+  doAssert runStaged(havingOrder) == directRows(havingOrder).mapIt(it.join(","))
+  doAssert runStaged(havingOrder) == @["Bob,1,20", "Ada,2,17"]
+  let havingAnd = parseSql("select * from t.csv group by Name sum Value having sum_Value > 10 and count >= 2", resolve)
+  doAssert runStaged(havingAnd) == directRows(havingAnd).mapIt(it.join(","))
+  doAssert runStaged(havingAnd) == @["Ada,2,17"]
+  var badHavingDirect = false
+  try: discard directRows(parseSql("select * from t.csv group by Name sum Value having Value > 10", resolve))
+  except AssertionDefect: badHavingDirect = true
+  doAssert badHavingDirect
+  var badHavingStaged = false
+  try: discard runStaged(parseSql("select * from t.csv group by Name sum Value having Value > 10", resolve))
+  except AssertionDefect: badHavingStaged = true
+  doAssert badHavingStaged
   # AND binds tighter than OR: this selects both Ada rows and Bob's row.
   let mixed = parseSql("select * from t.csv where Name='Ada' or Flag='no' and Value=20", resolve)
   doAssert runStaged(mixed) == @["Ada,yes,10", "Bob,no,20", "Ada,yes,7"]
