@@ -427,7 +427,7 @@ proc execOpWith(q: Operator; emitRow: proc(f: seq[RField]): Rep[Unit];
   ## Build the residual from the operator's fields.  The only host-side work
   ## here is choosing typed columns from the CSV fixture; all scanning,
   ## hashing, probing, buffering, and output are Rep nodes.
-  let cap = 64
+  let cap = 256
   var vars = sharedVars
   var ints = sharedInts
   var strings = sharedStrings
@@ -867,6 +867,13 @@ when isMainModule:
   for i in 0 ..< 40: manyGroups.add("G" & $i & "," & $(i + 1) & "," & $(i + 2) & "\n")
   let manyAggs = group(@["name"], @["a", "b"], scan(manyGroups, @["name", "a", "b"]))
   doAssert sorted(runStaged(manyAggs)) == sorted(directRows(manyAggs).mapIt(it.join(",")))
+
+  var hundredGroups = "name,a,b\n"
+  for i in 0 ..< 100: hundredGroups.add("G" & $i & "," & $(i + 1) & "," & $(i + 2) & "\n")
+  let hundredAggs = group(@["name"], @["a", "b"], scan(hundredGroups, @["name", "a", "b"]))
+  let hundredStaged = runStaged(hundredAggs)
+  doAssert sorted(hundredStaged) == sorted(directRows(hundredAggs).mapIt(it.join(",")))
+  doAssert hundredStaged.len == 100
 
   let nonKeyStringCsv = "name,dept,amount\nAda,10,2\nBob,20,3\nAda,30,5\n"
   let nonKeyStringGroup = group(@["name"], @["amount"], scan(nonKeyStringCsv,@["name","dept","amount"]))
