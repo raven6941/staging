@@ -49,3 +49,5 @@ tests/test_query
 tests/test_query_optc
 tests/test_sql_parser
 tests/test_veccomplex_arith
+tests/test_compiler
+tests/test_linq
