@@ -77,7 +77,7 @@ type
     left*, right*: Ref
     a*, b*: Predicate
   AggKind* = enum akSum, akAvg, akMin, akMax
-  OpKind* = enum okScan, okFilter, okProject, okJoin, okHashJoin, okGroup, okSort, okLimit, okPrintCSV
+  OpKind* = enum okScan, okFilter, okProject, okJoin, okHashJoin, okGroup, okSort, okLimit, okOffset, okPrintCSV
   Operator* = ref object
     kind: OpKind
     csv, csvRight: string
@@ -145,7 +145,7 @@ proc resultSchema*(q: Operator): seq[string] =
     for j, name in q.aggregates:
       aggregateNames.add(aggName(q.aggKinds[j]) & "_" & name)
     q.keys & @["count"] & aggregateNames
-  of okSort, okLimit: resultSchema(q.parent)
+  of okSort, okLimit, okOffset: resultSchema(q.parent)
 
 proc opShape*(q: Operator): string =
   ## A compact structural view used by the SQL front-end tests.
@@ -162,6 +162,7 @@ proc opShape*(q: Operator): string =
   of okSort:
     "Sort(" & q.sortKeys.mapIt(it & ":" & (if q.sortDesc[q.sortKeys.find(it)]: "desc" else: "asc")).join(",") & ";" & opShape(q.parent) & ")"
   of okLimit: "Limit(" & $q.n & ";" & opShape(q.parent) & ")"
+  of okOffset: "Offset(" & $q.n & ";" & opShape(q.parent) & ")"
   of okPrintCSV: "Print(" & opShape(q.parent) & ")"
 
 proc lookup(s: seq[string]; n: string): int =
@@ -173,6 +174,8 @@ proc orderBy*(keys: seq[string]; dirs: seq[bool]; q: Operator): Operator =
   Operator(kind: okSort, sortKeys: keys, sortDesc: dirs, parent: q)
 proc limit*(n: int; q: Operator): Operator =
   Operator(kind: okLimit, n: n, parent: q)
+proc offset*(m: int; q: Operator): Operator =
+  Operator(kind: okOffset, n: m, parent: q)
 
 proc parseRows*(csv: string; delim = ','): seq[seq[string]] =
   for line in csv.strip.splitLines[1 .. ^1]:
@@ -203,7 +206,7 @@ proc refKind(r: Ref; schema: seq[string]; kinds: seq[bool]): FieldKind =
 proc columnKinds(q: Operator): seq[bool] =
   case q.kind
   of okScan: result = sourceKinds(q.csv, q.schema, q.delim)
-  of okFilter, okPrintCSV, okSort, okLimit: result = columnKinds(q.parent)
+  of okFilter, okPrintCSV, okSort, okLimit, okOffset: result = columnKinds(q.parent)
   of okProject:
     let parentSchema = resultSchema(q.parent)
     let input = if q.inputSchema.len == 0: q.outputSchema else: q.inputSchema
@@ -319,6 +322,10 @@ proc directRows(q: Operator): seq[seq[string]] =
     let parentRows = directRows(q.parent)
     let count = min(max(q.n, 0), parentRows.len)
     result = parentRows[0 ..< count]
+  of okOffset:
+    let parentRows = directRows(q.parent)
+    let start = min(max(q.n, 0), parentRows.len)
+    result = parentRows[start ..< parentRows.len]
   of okPrintCSV: result = directRows(q.parent)
 
 # Residual constructors.  In particular, Scanner position is a residual Var,
@@ -496,6 +503,15 @@ proc execOpWith(q: Operator; emitRow: proc(f: seq[RField]): Rep[Unit];
       ifB(ltI(vr(count), staticInt(q.n)),
         proc(): Rep[Unit] = seqs(emitRow(f), vw(count, intAdd(vr(count), staticInt(1)))),
         proc(): Rep[Unit] = discardFields(f))
+    var parentBody: Rep[Unit]
+    discard execOpWith(q.parent, wrappedEmitRow, vars, ints, strings, parentBody, false)
+    body = parentBody
+  elif q.kind == okOffset:
+    let count = iv("offsetCount")
+    proc wrappedEmitRow(f: seq[RField]): Rep[Unit] =
+      ifB(ltI(vr(count), staticInt(q.n)),
+        proc(): Rep[Unit] = seqs(discardFields(f), vw(count, intAdd(vr(count), staticInt(1)))),
+        proc(): Rep[Unit] = emitRow(f))
     var parentBody: Rep[Unit]
     discard execOpWith(q.parent, wrappedEmitRow, vars, ints, strings, parentBody, false)
     body = parentBody
