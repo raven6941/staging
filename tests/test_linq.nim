@@ -78,8 +78,8 @@ type
     ## Non-generic base so the boundary/binder queries cover every
     ## DBForNode[B] instantiation without enumerating them.
     binder: string
-  DBForNode[B] = ref object of DBForBase
     sourceDb, table: string
+  DBForNode[B] = ref object of DBForBase
     body: Rep[seq[B]]
     ff: FunRecord[B]
   PredicateKind = enum pkAbove, pkBelow, pkAnd, pkOr, pkNot
@@ -121,8 +121,22 @@ proc nameOf(x: Rep[PersonRow]): Rep[string] = rowField[string](x, "name")
 proc ageOf(x: Rep[PersonRow]): Rep[int] = rowField[int](x, "age")
 proc nameValue(x: Rep[string]): Rep[NameRow] = dynamic[NameRow](NameValueNode(name: x))
 proc orgField[A, T](x: Rep[A], name: string): Rep[T] =
-  dynamic[T](FieldNode(binder: RowNode(x.node).binder, field: name))
+  if x.node of RowNode:
+    return dynamic[T](FieldNode(binder: RowNode(x.node).binder, field: name))
+  raise newException(ValueError, "field projection needs a row")
 proc dptOf(x: Rep[DptRow]): Rep[string] = orgField[DptRow, string](x, "dpt")
+proc nestedDptOf(x: Rep[NestedDptRow]): Rep[string] =
+  if x.node of NestedDptValueNode: return NestedDptValueNode(x.node).dpt
+  if x.node of RowNode: return orgField[NestedDptRow, string](x, "dpt")
+  raise newException(ValueError, "nested department projection needs a value or row")
+proc nestedEmployeesOf(x: Rep[NestedDptRow]): Rep[seq[NestedEmpRow]] =
+  if x.node of NestedDptValueNode: return NestedDptValueNode(x.node).employees
+  if x.node of RowNode: return orgField[NestedDptRow, seq[NestedEmpRow]](x, "employees")
+  raise newException(ValueError, "nested employee projection needs a value or row")
+proc nestedTasksOf(x: Rep[NestedEmpRow]): Rep[seq[string]] =
+  if x.node of NestedEmpValueNode: return NestedEmpValueNode(x.node).tasks
+  if x.node of RowNode: return orgField[NestedEmpRow, seq[string]](x, "tasks")
+  raise newException(ValueError, "nested task projection needs a value or row")
 proc empDptOf(x: Rep[EmpRow]): Rep[string] = orgField[EmpRow, string](x, "dpt")
 proc empOf(x: Rep[EmpRow]): Rep[string] = orgField[EmpRow, string](x, "emp")
 proc taskEmpOf(x: Rep[TaskRow]): Rep[string] = orgField[TaskRow, string](x, "emp")
@@ -242,6 +256,12 @@ proc listMap[A, B](l: Rep[seq[A]], f: proc(x: Rep[A]): Rep[B] {.closure.}): Rep[
 proc listFilter[A](l: Rep[seq[A]], f: proc(x: Rep[A]): Rep[bool] {.closure.}): Rep[seq[A]] =
   dbfor(l, proc(x: Rep[A]): Rep[seq[A]] = listIf(f(x), yieldList(x), emptyList[A]()))
 
+proc any[T](xs: Rep[seq[T]], p: proc(x: Rep[T]): Rep[bool] {.closure.}): Rep[bool] =
+  exists(listMap(listFilter(xs, p), proc(x: Rep[T]): Rep[EmptyRow] {.closure.} = emptyRow()))
+proc all[T](xs: Rep[seq[T]], p: proc(x: Rep[T]): Rep[bool] {.closure.}): Rep[bool] =
+  notR(any(xs, proc(x: Rep[T]): Rep[bool] {.closure.} = notR(p(x))))
+proc contains(xs: Rep[seq[string]], u: Rep[string]): Rep[bool] =
+  any(xs, proc(x: Rep[string]): Rep[bool] {.closure.} = eqR(x, u))
 let db = database[PeopleDB]("db")
 proc satisfies(p: proc(x: Rep[int]): Rep[bool] {.closure.}): Rep[seq[NameRow]] =
   listMap(listFilter(people(db), proc(x: Rep[PersonRow]): Rep[bool] {.closure.} = p(ageOf(x))),
@@ -270,6 +290,13 @@ proc expertise(u: Rep[string]): Rep[seq[DptRow]] =
   listMap(listFilter(departments(org), proc(d: Rep[DptRow]): Rep[bool] {.closure.} =
     notR(employeeMatches(d, u))),
   proc(d: Rep[DptRow]): Rep[DptRow] {.closure.} = dptValue(dptOf(d)))
+
+proc nestedOrgQuery(): Rep[seq[NestedDptRow]]
+proc expertise2(u: Rep[string]): Rep[seq[DptRow]] =
+  listMap(listFilter(nestedOrgQuery(), proc(d: Rep[NestedDptRow]): Rep[bool] {.closure.} =
+    all(nestedEmployeesOf(d), proc(e: Rep[NestedEmpRow]): Rep[bool] {.closure.} =
+      contains(nestedTasksOf(e), u))),
+  proc(d: Rep[NestedDptRow]): Rep[DptRow] {.closure.} = dptValue(nestedDptOf(d)))
 
 proc nestedOrgQuery(): Rep[seq[NestedDptRow]] =
   listMap(departments(org), proc(d: Rep[DptRow]): Rep[NestedDptRow] {.closure.} =
@@ -320,6 +347,30 @@ proc emitBool(r: Rep[bool]): string =
 var existsCounter = 0
 
 proc emitBoolHoisted(r: Rep[bool], indent: string): tuple[pre, expr: string]
+proc emitExistsStrings(r: Rep[seq[string]], indent, flag: string): string =
+  if r.node of DBForNode[string]:
+    let n = DBForNode[string](r.node)
+    return indent & "for " & n.binder & " in org." & n.table & ":\n" & emitExistsStrings(n.body, indent & "  ", flag)
+  let n = ListNode[string](r.node)
+  case n.kind
+  of lkEmpty: ""
+  of lkYield: indent & flag & " = true\n"
+  of lkConcat: emitExistsStrings(n.left, indent, flag) & emitExistsStrings(n.right, indent, flag)
+  of lkIf:
+    let c = emitBoolHoisted(n.cond, indent)
+    c.pre & indent & "if " & c.expr & ":\n" & emitExistsStrings(n.thenB, indent & "  ", flag)
+proc emitExistsNestedEmps(r: Rep[seq[NestedEmpRow]], indent, flag: string): string =
+  if r.node of DBForNode[NestedEmpRow]:
+    let n = DBForNode[NestedEmpRow](r.node)
+    return indent & "for " & n.binder & " in org." & n.table & ":\n" & emitExistsNestedEmps(n.body, indent & "  ", flag)
+  let n = ListNode[NestedEmpRow](r.node)
+  case n.kind
+  of lkEmpty: ""
+  of lkYield: indent & flag & " = true\n"
+  of lkConcat: emitExistsNestedEmps(n.left, indent, flag) & emitExistsNestedEmps(n.right, indent, flag)
+  of lkIf:
+    let c = emitBoolHoisted(n.cond, indent)
+    c.pre & indent & "if " & c.expr & ":\n" & emitExistsNestedEmps(n.thenB, indent & "  ", flag)
 proc emitEmpty(r: Rep[seq[EmptyRow]], indent: string, flag: string): string =
   if r.node of DBForNode[EmptyRow]:
     let n = DBForNode[EmptyRow](r.node)
@@ -340,6 +391,16 @@ proc emitBoolHoisted(r: Rep[bool], indent: string): tuple[pre, expr: string] =
     let flag = "exists" & $existsCounter
     let e = ExistsNode[EmptyRow](r.node)
     return (indent & "var " & flag & " = false\n" & emitEmpty(e.source, indent, flag), flag)
+  if r.node of ExistsNode[string]:
+    inc existsCounter
+    let flag = "exists" & $existsCounter
+    let e = ExistsNode[string](r.node)
+    return (indent & "var " & flag & " = false\n" & emitExistsStrings(e.source, indent, flag), flag)
+  if r.node of ExistsNode[NestedEmpRow]:
+    inc existsCounter
+    let flag = "exists" & $existsCounter
+    let e = ExistsNode[NestedEmpRow](r.node)
+    return (indent & "var " & flag & " = false\n" & emitExistsNestedEmps(e.source, indent, flag), flag)
   if r.node of ScalarNode[string] or r.node of ScalarNode[int]:
     return ("", emitBool(r))
   if r.node of ScalarNode[bool]:
@@ -465,7 +526,7 @@ proc oracleSatisfies(db: PeopleDB, pred: proc(age: int): bool): seq[string] =
     if pred(p.age): result.add(p.name)
 
 proc compileRun(src: string): string =
-  let dir = getTempDir() / ("linq-" & $epochTime().int)
+  let dir = getTempDir() / ("linq-" & $epochTime().int & "-" & $funCounter)
   createDir(dir); let path = dir / "main.nim"; let exe = dir / "main"
   writeFile(path, "import std/strutils\n" & src)
   let c = execCmdEx(quoteShell(findExe("nim")) & " c --hints:off --nimcache:" & quoteShell(dir / "cache") & " --out:" & quoteShell(exe) & " " & quoteShell(path), {poUsePath, poStdErrToStdOut}, workingDir = dir)
@@ -763,4 +824,20 @@ when isMainModule:
   let nestedWrapped = concatList(nestedOrg, nestedOrg)
   doAssert occurrences(nestedWrapped.node, cb).getOrDefault("field") == 0
   doAssert occurrences(nestedWrapped.node, linqCallbacksOpen()).getOrDefault("field") > 0
+  let expertise2Query = expertise2(liftNow("abstract"))
+  let expertise2Source = nestedSource[0 .. nestedSource.find("var results") - 1]
+    .replace("type NestedEmpRow", "type DptRow = object\n  dpt: string\ntype NestedEmpRow") &
+    "var results: seq[DptRow] = @[]\n" & emitDpts(expertise2Query, "results", "") &
+    "for d in results: echo d.dpt\n"
+  doAssert compileRun(expertise2Source) == "Quality\nResearch"
+  doAssert compileRun(expertise2Source.replace("== \"abstract\"", "== \"build\"")) == "Product\nQuality"
+  doAssert compileRun(expertise2Source.replace("== \"abstract\"", "== \"call\"")) == "Quality\nSales"
+  let expertise2Residual = emitDpts(expertise2Query, "results", "")
+  doAssert "in org.employees" in expertise2Residual
+  doAssert "in org.tasks" in expertise2Residual
+  doAssert "var exists" in expertise2Residual
+  doAssert "any(" notin expertise2Residual and "all(" notin expertise2Residual and "contains(" notin expertise2Residual
+  let expertise2Wrapped = concatList(expertise2Query, expertise2Query)
+  doAssert occurrences(expertise2Wrapped.node, cb).getOrDefault("field") == 0
+  doAssert occurrences(expertise2Wrapped.node, linqCallbacksOpen()).getOrDefault("field") > 0
   echo "ok: linq staged database comprehensions, normalization, effects, and residual execution"
