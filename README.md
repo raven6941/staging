@@ -27,16 +27,35 @@ let folded = lift(1) + lift(2)   # computed now, if your DSL folds it
 The framework itself does not generate code. It provides the binding-time
 discipline; your DSL provides the residual nodes and the smart constructors.
 That is the whole design: a small system, no graph IR, no runtime codegen,
-no optimization passes — except one, `genlet`.
+no optimization passes — except `genlet` and the ANF rewrites.
+
+Staticness is tracked two ways. A runtime `isStatic` flag drives folding in
+the smart constructors (the LMS mechanism). A `Rep[T, true]` type parameter
+marks a value as statically known at the boundary, so `getStatic` on a
+dynamic value is rejected at compile time instead of failing at staging time.
+
+The residual is a tree of DSL-owned nodes, identified by structural keys —
+not a graph. Building the same expression twice yields two subtrees until
+`genlet` hoists them under one `let`; sharing is explicit (let binders,
+named var and function references), never pointer identity. The ANF pass
+produces a linearized view of that tree; it does not replace the tree as
+the representation.
 
 ## Modules
 
 | Module | What it is |
 |---|---|
-| `staging/framework` | `Rep[T]`, `IRNode`, `lift`, `dynamic`, `smartOp` / `smartOpUni`, `smartLet`, `smartIf`, residual `Var[T]` cells with `readVar` / `writeVar`, `Rep[Unit]` statements with `seqR`, and the tagless-final hook. No imports at all. |
+| `staging/framework` | `Rep[T]` (with the optional static parameter `Rep[T, S]`), `IRNode`, `lift`, `liftNow`, `dynamic`, `smartOp` / `smartOpUni`, `smartLet`, `smartIf`, `smartWhile`, `smartFun`, residual `Var[T]` cells with `readVar` / `writeVar`, `Rep[Unit]` statements with `seqR`, and the tagless-final hook. No imports at all. |
 | `staging/csp` | Cross-stage persistence registry: declare every present-stage name the residual may reference, emit it only via `lift`, derive the residual's import block from the registry. No imports at all. |
-| `staging/genlet` | Residual let-insertion over `GTree`, or directly over a client IR through callbacks: common-subterm elimination with residual `let` binders, hoisting every repeated pure composite with at least 3 nodes. Stdlib only (`tables`, `sequtils`, `strutils`). |
+| `staging/genlet` | Residual let-insertion over `GTree`, or directly over a client IR through callbacks: common-subterm elimination with residual `let` binders, hoisting every repeated pure composite with at least 3 nodes, scope-aware placement, and effect gating via `isPure`. Stdlib only (`tables`, `sequtils`, `strutils`). |
+| `staging/traversal` | The shared IR API: `TraversalCallbacks` for bottom-up `mapTree`, binder-aware `substTree`, and `occurrences`; `GenletCallbacks` is its source-compatible alias. |
+| `staging/anf` | Tree-to-ANF conversion and ANF rewrites (`toAnf` / `fromAnf` / `optAnf` / `cseAnf` / `dceAnf`). ANF is a generic pass over the residual tree, not Def nodes in the residual and not a new IR. |
+| `staging/arrays` | Residual mutable arrays: `Arr[T]` cells following the `Var[T]` pattern, with `readArr` / `writeArr` nodes. Reads are never folded; writes are effectful. |
+| `staging/structs` | Pure staging-time products for grouping related `Rep` fields. Construction and projection are staging-time and free; arithmetic on the fields residualizes through the DSL's `smartOp`s. |
+| `staging/hoas` | NFA-to-DFA staging with HOAS builders and first-order named states. HOAS is used only as a builder: each named state is evaluated once into first-order data and the proc is discarded, never compared or stored. |
 | `staging/branch_policy` | Decision vocabulary for staged relational branching: tri-state outcomes, per-site gather/fallback/later policies with gather bounds, and residual plans including prune/refuse. Stdlib only (`tables`). |
+| `staging/modes` | Generic mode vocabulary and bound-on-all-paths analysis over a client goal tree: the fold unions sequential children and intersects alternative children. The client owns the goal tree and the query. |
+| `staging/specctx` | Small control skeleton for client-side partial deduction: signatures are memoized, new specializations consume fuel, recursive signatures are guarded, and dynamic variables are checked at the staging boundary. The client still owns terms, unification, and residual code. |
 
 ## Worked example: staging an arithmetic evaluator
 
@@ -75,7 +94,7 @@ staged prog1: static(9)
 ok: fully static folded to 9 at staging time
 staged prog2: dynamic((dynamic((dynamic(x) + static(1))) * static(2)))
 ok: dynamic variable residualized to IR
-ok: getStatic on dynamic Rep raises (staging-time error)
+ok: getStatic on dynamic Rep is rejected at compile time
 ```
 
 `prog1` folds entirely at staging time (static 9). `prog2` keeps `x`
@@ -160,6 +179,30 @@ residual's import block is derived from the used declarations
 (`tests/test_csp.nim`). Undeclared names raise at generation time instead
 of leaking silently into the residual.
 
+## Demonstrated ports
+
+The library is exercised against the LMS tutorials and the `04_atwork`
+examples, each ported end to end through the emit–compile–run harness where
+the residual is runnable. What exists today:
+
+- **LMS tutorials:** power staging with folding and CSP; stencil overlap
+  sharing; a staged regex matcher; FFT over Complex structs; the Ackermann
+  tower as residual functions; a scanner with effectful input; NFA-to-DFA
+  automata; an auto-specializing interpreter; a 1D stencil over dynamic
+  arrays.
+- **04_atwork:** a sequential streams core; VectorOps with lowering and
+  loop / reduction / horizontal fusion; Complex numbers including
+  tagged-union (Cartesian/Polar) forms and struct-of-arrays layouts;
+  TPCH-Q1-style fused group-by-sum; condition tracking for nested
+  conditionals.
+- **Query compiler:** a low-level staged query compiler and a staged SQL
+  front end — scans, filters, group-by, ORDER BY, LIMIT/OFFSET, DISTINCT,
+  aggregates (including string min/max), and IN / EXISTS / NOT IN /
+  NOT EXISTS subqueries with HAVING.
+- **LINQ (in progress):** a staged LINQ core — `Database` / `DBFor` nodes
+  with `dbfor` normalization, dynamic predicates, and nested comprehensions.
+  SQL emission is out of scope.
+
 ## Install
 
 Requires Nim >= 2.0.0. No dependencies beyond the standard library.
@@ -176,22 +219,23 @@ or clone and use `--path:src`.
 nimble test
 ```
 
-Runs `tests/test_framework.nim`, `tests/test_codegen.nim`,
-`tests/test_csp.nim`, and `tests/test_genlet.nim`. The codegen test
-additionally compiles and runs its emitted residual program. Verified on Nim
-2.2.12 and 2.4.0.
+Runs 46 test files, each a standalone `nim c -r` of one facility or port;
+the codegen tests additionally compile and run their emitted residual
+programs. CI runs `nimble test` on ubuntu-latest with Nim 2.0.8, 2.2.12,
+and 2.4.0, and on macos-latest with Nim 2.2.12.
 
 ## Scope — what this library does NOT yet include
 
 Honest boundaries, not roadmap promises:
 
 - **The relational staging client stays in Eponym.** `RelGoal`/`StageGoal`
-  goal representations, mode analysis, the `relcompile` residual compiler,
-  and the relational `genlet` over `RelGoal`/`RTerm` all depend on
-  miniKanren and on Eponym's elaborator core. They are the motivating
-  application of this framework, not part of it. If you want staged
-  relational programming, that lives in Eponym's
-  `src/experimental/staging/` for now.
+  goal representations, the `relcompile` residual compiler, and the
+  elaborator's mode tables all depend on miniKanren and on Eponym's
+  elaborator core. What *has* landed here is the generic relational
+  vocabulary: `branch_policy` (gather/fallback/later), `modes` (mode
+  analysis), relational genlet through the traversal callbacks, and the
+  `specctx` partial-deduction skeleton. If you want staged relational
+  programming, that lives in Eponym's `src/experimental/staging/` for now.
 - **`genlet` has two residual-tree interfaces.** `insertLets` works on the
   standalone `GTree` when a generic representation is convenient. For a DSL
   that already has its own residual IR, `insertLetsCb` traverses that IR
@@ -199,33 +243,30 @@ Honest boundaries, not roadmap promises:
   structural keys, rebuilding, binder-reference construction, and residual
   let construction. Use the callback form to avoid copying or mapping the IR
   to `GTree`; use `GTree` when the generic representation is simpler. Both
-  forms use the same work-based hoisting rule, treat `let` binders as sharing boundaries,
+  forms use the same hoist-every rule, treat `let` binders as sharing boundaries,
   and honor `isPure`: nil means pure, while false marks a sharing boundary.
   The classification's long-term home (callbacks or a framework-level node
   tag) remains open until another consumer needs it.
-- **`traversal` provides the shared IR API.** `TraversalCallbacks` describes a
-  client tree for bottom-up `mapTree`, binder-aware `substTree`, and
-  `occurrences`; `GenletCallbacks` is its source-compatible alias.
-- **No built-in runtime codegen, graph IR, or optimization passes.** The
-  residual is a tree your DSL interprets, prints, or compiles. The worked
-  arithmetic example shows a small DSL-level emitter; the framework itself
-  remains code-generation agnostic. `genlet` is the only optimization, and it
-  is a size optimization for pure computations — clients with effectful nodes
-  honor the optional `isPure` classification: nil means pure, while false
-  marks a sharing boundary.
+- **No built-in runtime codegen, graph IR, or optimization passes beyond
+  `genlet` and ANF.** The residual is a tree your DSL interprets, prints,
+  or compiles. The worked arithmetic example shows a small DSL-level emitter;
+  the framework itself remains code-generation agnostic.
 - **No macro/bracket syntax.** Staging is expressed through `Rep[T]` and
   smart constructors in ordinary Nim code, not through MetaOCaml-style
-  brackets and escape. A macro layer is out of scope for v0.1.0.
+  brackets and escape. A macro layer is out of scope.
+- **No parallel backends.** Delite-style DSLs, JS/Ajax codegen, and parallel
+  streams / loop fusion are out of scope; the library is codegen-agnostic by
+  design and its emitter is Nim-only.
 
 ## Direction
 
-The boundary above is the v0.1.0 state, not a permanent one. This
-library is expected to grow facilities targeted specifically at
-supporting the relational engine — the staged-relational client above
-is its motivating application — and the engine
-([raven6941/minikanren](https://github.com/raven6941/minikanren)) may
-eventually depend on this library. For now the engine stands alone
-with no staging dependency, and the relational client stays in Eponym.
+The relational facilities the library was extracted to support have largely
+landed (`branch_policy`, `modes`, relational genlet, `specctx`). The
+current work is the tutorial tail: the staged SQL front end and the LINQ
+core, filed as issues and worked through in order. The engine
+([raven6941/minikanren](https://github.com/raven6941/minikanren)) stands
+alone with no staging dependency for now, and may eventually depend on this
+library.
 
 ## License
 
