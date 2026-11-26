@@ -128,6 +128,14 @@ proc comparison(p: var Parser): Predicate =
     let sub = p.statement
     discard p.want(tkRParen)
     return existsSubquery(sub)
+  if p.isWord("not") and p.pos + 1 < p.tokens.len and
+      p.tokens[p.pos + 1].kind == tkWord and p.tokens[p.pos + 1].text == "exists":
+    discard p.take
+    discard p.take
+    discard p.want(tkLParen)
+    let sub = p.statement
+    discard p.want(tkRParen)
+    return notExistsSubquery(sub)
   let a = p.refValue
   if p.acceptWord("not"):
     if not p.acceptWord("in"): raise p.parseError(p.current, "in")
@@ -276,6 +284,7 @@ when isMainModule:
   expectShape("select * from multi.csv where Name in (select Name from t.csv where Value=20)", "Filter(In(Name;Project(Name;Name;Filter(Scan(Name,Flag,Value))));Scan(Dept,Name,Value))", resolve)
   expectShape("select * from multi.csv where Name not in (select Name from t.csv where Value=20)", "Filter(NotIn(Name;Project(Name;Name;Filter(Scan(Name,Flag,Value))));Scan(Dept,Name,Value))", resolve)
   expectShape("select * from t.csv where exists (select Name from multi.csv)", "Filter(Exists(Project(Name;Name;Scan(Dept,Name,Value)));Scan(Name,Flag,Value))", resolve)
+  expectShape("select * from t.csv where not exists (select Name from multi.csv)", "Filter(NotExists(Project(Name;Name;Scan(Dept,Name,Value)));Scan(Name,Flag,Value))", resolve)
   expectShape("select * from t.csv group by Name sum Value having sum_Value > 10", "Having(sum_Value>10;Group(Name;sum:Value;Scan(Name,Flag,Value)))", resolve)
   expectShape("select * from t.csv group by Name sum Value, min Value", "Group(Name;sum:Value,min:Value;Scan(Name,Flag,Value))", resolve)
   expectShape("select * from t.csv order by Value desc", "Sort(Value:desc;Scan(Name,Flag,Value))", resolve)
@@ -402,6 +411,39 @@ when isMainModule:
   let existsProjected = parseSql("select Name from t.csv where exists (select Name from multi.csv)", resolve)
   doAssert runStaged(existsProjected) == directRows(existsProjected).mapIt(it.join(","))
   doAssert runStaged(existsProjected) == @["Ada", "Bob", "Ada"]
+  # Load-bearing: this assertion fails if the residual NOT EXISTS probe is
+  # stubbed or inverted (verified by stubbing it once, observing the failure,
+  # then restoring it).
+  let notExistsRows = parseSql("select * from t.csv where not exists (select Name from multi.csv)", resolve)
+  doAssert runStaged(notExistsRows) == directRows(notExistsRows).mapIt(it.join(","))
+  doAssert runStaged(notExistsRows) == @[]
+  let notExistsEmpty = parseSql("select * from t.csv where not exists (select Name from empty.csv)", resolve)
+  doAssert runStaged(notExistsEmpty) == directRows(notExistsEmpty).mapIt(it.join(","))
+  doAssert runStaged(notExistsEmpty) == @["Ada,yes,10", "Bob,no,20", "Ada,yes,7"]
+  let notExistsAnd = parseSql("select * from t.csv where not exists (select Name from multi.csv) and Value=10", resolve)
+  doAssert runStaged(notExistsAnd) == directRows(notExistsAnd).mapIt(it.join(","))
+  doAssert runStaged(notExistsAnd) == @[]
+  let notExistsEmptyAnd = parseSql("select * from t.csv where not exists (select Name from empty.csv) and Value=10", resolve)
+  doAssert runStaged(notExistsEmptyAnd) == directRows(notExistsEmptyAnd).mapIt(it.join(","))
+  doAssert runStaged(notExistsEmptyAnd) == @["Ada,yes,10"]
+  let notExistsGrouped = parseSql("select * from t.csv where not exists (select Name from multi.csv group by Name sum Value)", resolve)
+  doAssert runStaged(notExistsGrouped) == directRows(notExistsGrouped).mapIt(it.join(","))
+  doAssert runStaged(notExistsGrouped) == @[]
+  let notExistsGroupedEmpty = parseSql("select * from t.csv where not exists (select Name from multi.csv where Dept=99 group by Name sum Value)", resolve)
+  doAssert runStaged(notExistsGroupedEmpty) == directRows(notExistsGroupedEmpty).mapIt(it.join(","))
+  doAssert runStaged(notExistsGroupedEmpty) == @["Ada,yes,10", "Bob,no,20", "Ada,yes,7"]
+  let notExistsFiltered = parseSql("select * from multi.csv where not exists (select Name from t.csv where Value=20)", resolve)
+  doAssert runStaged(notExistsFiltered) == directRows(notExistsFiltered).mapIt(it.join(","))
+  doAssert runStaged(notExistsFiltered) == @[]
+  let notExistsFilteredEmpty = parseSql("select * from multi.csv where not exists (select Name from t.csv where Value=99)", resolve)
+  doAssert runStaged(notExistsFilteredEmpty) == directRows(notExistsFilteredEmpty).mapIt(it.join(","))
+  doAssert runStaged(notExistsFilteredEmpty) == @["10,Ada,2", "10,Bob,3", "10,Ada,5"]
+  let notExistsProjected = parseSql("select Name from t.csv where not exists (select Name from multi.csv)", resolve)
+  doAssert runStaged(notExistsProjected) == directRows(notExistsProjected).mapIt(it.join(","))
+  doAssert runStaged(notExistsProjected) == @[]
+  let notExistsProjectedEmpty = parseSql("select Name from t.csv where not exists (select Name from empty.csv)", resolve)
+  doAssert runStaged(notExistsProjectedEmpty) == directRows(notExistsProjectedEmpty).mapIt(it.join(","))
+  doAssert runStaged(notExistsProjectedEmpty) == @["Ada", "Bob", "Ada"]
   var badInDirect = false
   try: discard directRows(parseSql("select * from t.csv where Value in (select Name from multi.csv)", resolve))
   except AssertionDefect: badInDirect = true
