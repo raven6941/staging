@@ -98,6 +98,12 @@ proc exprFreeVars(e: Expr): seq[string] =
     for name in exprFreeVars(child):
       if name notin result: result.add(name)
 
+proc exprRefs(e: Expr): seq[string] =
+  if e.kind == ekRef: return @[e.name]
+  for child in exprChildren(e):
+    for name in exprRefs(child):
+      if name notin result: result.add(name)
+
 when isMainModule:
   let env = {"a": 3, "b": 5}.toTable
 
@@ -225,9 +231,10 @@ when isMainModule:
 
   # LICM splices every invariant binding before the loop, in original order,
   # without duplicating them or reordering the surrounding bindings.
-  let multiHoist = toAnf(
+  let multiHoistExpr =
     add(loop(add(mul(input("n"), lit(2)), add(input("a"), lit(1)))),
-        input("b")), licmCb)
+        input("b"))
+  let multiHoist = toAnf(multiHoistExpr, licmCb)
   let multiMoved = licmAnf(multiHoist, licmCb)
   doAssert multiMoved.stmts.len == 4
   doAssert multiMoved.stmts[0].rhs.kind == ekMul
@@ -238,6 +245,33 @@ when isMainModule:
   doAssert multiMoved.stmts[3].rhs.kind == ekAdd
   doAssert evalExpr(fromAnf(multiMoved, licmCb),
                     {"a": 3, "b": 5, "n": 4}.toTable) == 17
+
+  # DCE after LICM must retain hoisted bindings used by the nested region.
+  let piped = dceAnf(licmAnf(toAnf(multiHoistExpr, licmCb), licmCb), licmCb)
+  doAssert piped.stmts.len == 4
+  let roundTripped = fromAnf(piped, licmCb)
+  let validNames = {"a": true, "b": true, "n": true}.toTable
+  for name in exprRefs(roundTripped):
+    var bound = false
+    for stmt in piped.stmts:
+      if stmt.name == name: bound = true
+    doAssert name in validNames or bound
+  doAssert evalExpr(roundTripped, {"a": 3, "b": 5, "n": 4}.toTable) == 17
+
+  # CSE after LICM must rewrite an outer alias inside a nested region.
+  let cseAfterLicmExpr = add(mul(input("n"), lit(2)),
+                             loop(add(mul(input("n"), lit(2)), refE("i"))))
+  let cseAfterLicm = licmAnf(toAnf(cseAfterLicmExpr, licmCb), licmCb)
+  let cseAfterLicmResult = cseAnf(cseAfterLicm, licmCb)
+  let cseRoundTripped = fromAnf(cseAfterLicmResult, licmCb)
+  let cseValidNames = {"a": true, "b": true, "n": true, "i": true}.toTable
+  for name in exprRefs(cseRoundTripped):
+    var bound = false
+    for stmt in cseAfterLicmResult.stmts:
+      if stmt.name == name: bound = true
+    doAssert name in cseValidNames or bound
+  doAssert evalExpr(cseRoundTripped, {"a": 3, "b": 5, "n": 4, "i": 7}.toTable) ==
+    evalExpr(cseAfterLicmExpr, {"a": 3, "b": 5, "n": 4, "i": 7}.toTable)
 
   # A loop binder, a mutable/read binding, an effect, and a non-total node
   # each prevent motion. The read dependency also checks transitivity.
