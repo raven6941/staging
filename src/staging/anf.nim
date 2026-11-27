@@ -44,6 +44,9 @@
 ##   keep it out of CSE; otherwise two reads would collapse into one.
 ##   `isAtomic` lets the client force such a node to be bound (never
 ##   inlined as an atom) even though it has no children.
+## - For LICM, `freeVars` must exclude any name whose value the region may
+##   change (Var reads, mutable cells). Listing Var reads in `freeVars` gives
+##   unsound motion; this is a client obligation like `key` / `isPure`.
 ## - A rewrite rule must return an atom (literal, input, or reference)
 ##   or its input unchanged; returning a composite node is a client bug
 ##   and is asserted against.
@@ -62,6 +65,7 @@ type
     binders*: proc(node: T): seq[string]
     freeVars*: proc(node: T): seq[string]
     isPure*: proc(node: T): bool
+    isTotal*: proc(node: T): bool
 
   AnfProg*[T] = object
     stmts*: seq[AnfBinding[T]]
@@ -259,4 +263,66 @@ proc optAnf*[T](prog: AnfProg[T]; cb: AnfCallbacks[T];
     doAssert cb.isAtomic(rewrittenRes),
       "ANF rewrite must return an atom or its input unchanged"
     outProg.result = rewrittenRes
+  outProg
+
+proc licmAnf*[T](prog: AnfProg[T]; cb: AnfCallbacks[T]): AnfProg[T] =
+  ## Hoist pure, total loop/fun-body bindings into the enclosing region.
+  ## This pass is deliberately standalone; optAnf's pipeline runs it after
+  ## cseAnf and before dceAnf so newly dead bindings can be swept afterward.
+  ## Missing safety callbacks conservatively disable motion.
+  if cb.isBoundary.isNil or cb.binders.isNil or cb.freeVars.isNil or
+     cb.isPure.isNil or cb.isTotal.isNil:
+    return prog
+
+  proc hoistRegion(region: AnfProg[T]; boundary: T): seq[AnfBinding[T]] =
+    var bound = initTable[string, bool]()
+    for stmt in region.stmts: bound[stmt.name] = true
+    var hoisted = initTable[string, bool]()
+    let boundaryNames = cb.binders(boundary)
+    let resultName = cb.refName(region.result)
+    var moved: seq[AnfBinding[T]] = @[]
+    for stmt in region.stmts:
+      var canMove = stmt.nested.len == 0 and cb.isPure(stmt.rhs) and
+                    cb.isTotal(stmt.rhs)
+      if canMove:
+        let vars = cb.freeVars(stmt.rhs)
+        # A result with region-local inputs cannot be spliced out without
+        # also changing the boundary/result interface. A dependency-free
+        # result (including a nullary effect under a deliberately permissive
+        # isPure callback) is safe to reference from the parent region.
+        if stmt.name == resultName and vars.len > 0:
+          canMove = false
+        for name in vars:
+          if name in boundaryNames:
+            canMove = false
+          elif name in bound and name notin hoisted:
+            canMove = false
+      if canMove:
+        moved.add(stmt)
+        hoisted[stmt.name] = true
+    moved
+
+  var outProg = prog
+  var i = 0
+  while i < outProg.stmts.len:
+    var stmt = outProg.stmts[i]
+    var movedBefore: seq[AnfBinding[T]] = @[]
+    for j in 0 ..< stmt.nested.len:
+      stmt.nested[j] = licmAnf(stmt.nested[j], cb)
+      let moved = hoistRegion(stmt.nested[j], stmt.rhs)
+      if moved.len > 0:
+        var retained: seq[AnfBinding[T]] = @[]
+        for candidate in stmt.nested[j].stmts:
+          var keep = true
+          for movedStmt in moved:
+            if candidate.name == movedStmt.name: keep = false
+          if keep: retained.add(candidate)
+        stmt.nested[j].stmts = retained
+        movedBefore.add(moved)
+    outProg.stmts[i] = stmt
+    if movedBefore.len > 0:
+      for k in countdown(movedBefore.high, 0):
+        outProg.stmts.insert(movedBefore[k], i)
+      i += movedBefore.len
+    inc i
   outProg
