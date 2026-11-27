@@ -2,7 +2,7 @@ import staging/anf
 import std/[tables]
 
 type
-  ExprKind = enum ekLit, ekInput, ekRef, ekAdd, ekMul, ekLoop, ekEffect
+  ExprKind = enum ekLit, ekInput, ekRef, ekAdd, ekMul, ekLoop, ekEffect, ekRead
   Expr = ref object
     kind: ExprKind
     value: int
@@ -16,6 +16,7 @@ proc add(a, b: Expr): Expr = Expr(kind: ekAdd, left: a, right: b)
 proc mul(a, b: Expr): Expr = Expr(kind: ekMul, left: a, right: b)
 proc loop(body: Expr): Expr = Expr(kind: ekLoop, left: body)
 proc effect(): Expr = Expr(kind: ekEffect)
+proc readVar(): Expr = Expr(kind: ekRead)
 
 proc exprChildren(e: Expr): seq[Expr] =
   case e.kind
@@ -39,6 +40,7 @@ proc exprKey(e: Expr): string =
   of ekMul: "mul(" & exprKey(e.left) & "," & exprKey(e.right) & ")"
   of ekLoop: "loop(" & exprKey(e.left) & ")"
   of ekEffect: "effect"
+  of ekRead: "read"
 
 proc exprIsAtomic(e: Expr): bool =
   e.kind in {ekLit, ekInput, ekRef}
@@ -61,7 +63,7 @@ proc evalExpr(e: Expr; env: Table[string, int]): int =
   of ekAdd: evalExpr(e.left, env) + evalExpr(e.right, env)
   of ekMul: evalExpr(e.left, env) * evalExpr(e.right, env)
   of ekLoop: evalExpr(e.left, env)
-  of ekEffect: 99
+  of ekEffect, ekRead: 99
 
 proc arithOpt(e: Expr): Expr =
   ## ArithExpOpt-style: identities + constant folding, visible directly
@@ -86,6 +88,12 @@ proc checkAnfInvariant[T](prog: AnfProg[T]; cb: AnfCallbacks[T]) =
   for stmt in prog.stmts:
     for child in cb.children(stmt.rhs):
       doAssert cb.isAtomic(child), "ANF rhs child must be atomic"
+
+proc exprFreeVars(e: Expr): seq[string] =
+  if e.kind == ekRef: return @[e.name]
+  for child in exprChildren(e):
+    for name in exprFreeVars(child):
+      if name notin result: result.add(name)
 
 when isMainModule:
   let env = {"a": 3, "b": 5}.toTable
@@ -174,5 +182,51 @@ when isMainModule:
     toAnf(loop(add(input("a"), lit(1))), boundaryCb), boundaryCb, loopDrop)
   doAssert droppedPureLoop.stmts.len == 0
   doAssert evalExpr(fromAnf(droppedPureLoop, boundaryCb), env) == 0
+
+  # LICM moves only the invariant inner binding, preserving the region
+  # result's reference to it and therefore its evaluation.
+  var licmCb = boundaryCb
+  licmCb.freeVars = exprFreeVars
+  licmCb.isTotal = proc(e: Expr): bool = true
+  let beforeLicm = toAnf(loop(add(mul(input("n"), lit(2)), input("a"))), licmCb)
+  doAssert beforeLicm.stmts[0].nested[0].stmts.len == 2
+  let moved = licmAnf(beforeLicm, licmCb)
+  doAssert moved.stmts.len == 2
+  doAssert moved.stmts[0].rhs.kind == ekMul
+  doAssert moved.stmts[1].nested[0].stmts.len == 1
+  doAssert evalExpr(fromAnf(moved, licmCb), {"a": 3, "n": 4}.toTable) == 11
+
+  # A loop binder, a mutable/read binding, an effect, and a non-total node
+  # each prevent motion. The read dependency also checks transitivity.
+  let boundBody = licmAnf(
+    toAnf(loop(add(refE("i"), input("a"))), licmCb), licmCb)
+  doAssert boundBody.stmts[0].nested[0].stmts.len == 1
+
+  var readCb = licmCb
+  readCb.isPure = proc(e: Expr): bool = e.kind notin {ekEffect, ekRead}
+  let readBody = licmAnf(
+    toAnf(loop(add(readVar(), refE("t0"))), readCb), readCb)
+  doAssert readBody.stmts[0].nested[0].stmts.len == 2
+
+  let effectBody = licmAnf(toAnf(loop(effect()), licmCb), licmCb)
+  doAssert effectBody.stmts[0].nested[0].stmts.len == 1
+  var unsafePure = licmCb
+  unsafePure.isPure = proc(e: Expr): bool = true
+  doAssert licmAnf(toAnf(loop(effect()), unsafePure), unsafePure).
+    stmts[1].nested[0].stmts.len == 0
+
+  var partial = licmCb
+  partial.isTotal = proc(e: Expr): bool = false
+  doAssert licmAnf(toAnf(loop(mul(input("n"), lit(2))), partial), partial).
+    stmts[0].nested[0].stmts.len == 1
+
+  # No free-variable information means no LICM, even when all other
+  # callbacks claim that motion would be safe.
+  var noFreeVars = licmCb
+  noFreeVars.freeVars = nil
+  let unchanged = licmAnf(toAnf(loop(mul(input("n"), lit(2))), noFreeVars),
+                          noFreeVars)
+  doAssert unchanged.stmts.len == 1
+  doAssert unchanged.stmts[0].nested[0].stmts.len == 1
 
   echo "ok: ANF conversion, ArithExpOpt rewrite, and stencil CSE"
