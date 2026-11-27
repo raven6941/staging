@@ -198,10 +198,35 @@ proc cseAnf*[T](prog: AnfProg[T]; cb: AnfCallbacks[T]): AnfProg[T] =
   var aliases = initTable[string, T]()
   var outProg = AnfProg[T](stmts: @[])
   let effects = effectNames(prog, cb)
+  proc rewriteOuterAliases(region: AnfProg[T]; inherited: Table[string, bool]): AnfProg[T] =
+    var local = inherited
+    for stmt in region.stmts: local[stmt.name] = true
+    proc rewrite(node: T): T =
+      if cb.isAtomic(node):
+        let name = cb.refName(node)
+        if name.len > 0 and name notin local and name in aliases:
+          var target = aliases[name]
+          while cb.refName(target).len > 0 and cb.refName(target) in aliases:
+            target = aliases[cb.refName(target)]
+          return target
+        return node
+      var kids: seq[T] = @[]
+      for child in cb.children(node): kids.add(rewrite(child))
+      cb.rebuild(node, kids)
+    var outRegion = region
+    for i in 0 ..< outRegion.stmts.len:
+      outRegion.stmts[i].rhs = rewrite(outRegion.stmts[i].rhs)
+      for j in 0 ..< outRegion.stmts[i].nested.len:
+        outRegion.stmts[i].nested[j] =
+          rewriteOuterAliases(outRegion.stmts[i].nested[j], local)
+    outRegion.result = rewrite(outRegion.result)
+    outRegion
   for stmt in prog.stmts:
     var nested: seq[AnfProg[T]] = @[]
     for region in stmt.nested:
       nested.add(cseAnf(region, cb))
+    for i in 0 ..< nested.len:
+      nested[i] = rewriteOuterAliases(nested[i], initTable[string, bool]())
     let rhs = substRefs(stmt.rhs, aliases, cb)
     let k = cb.key(rhs)
     let effectful = stmt.name in effects
@@ -221,8 +246,8 @@ proc cseAnf*[T](prog: AnfProg[T]; cb: AnfCallbacks[T]): AnfProg[T] =
 proc dceAnf*[T](prog: AnfProg[T]; cb: AnfCallbacks[T]): AnfProg[T] =
   ## Drop bindings no later binding and no result references. One
   ## backward walk suffices: a binding's right-hand side only mentions
-  ## earlier bindings, so a name is live iff it is used by the result or
-  ## by a kept later binding.
+  ## earlier bindings, so a name is live iff it is used by the result, by
+  ## a kept later binding, or by a kept nested region.
   var used = initTable[string, bool]()
   let effects = effectNames(prog, cb)
   let nonTotals = nonTotalNames(prog, cb)
@@ -232,6 +257,20 @@ proc dceAnf*[T](prog: AnfProg[T]; cb: AnfCallbacks[T]): AnfProg[T] =
       if name.len > 0: used[name] = true
     else:
       for child in cb.children(node): markUsed(child)
+  proc markRegionOuterUses(region: AnfProg[T]; inherited: Table[string, bool]) =
+    var local = inherited
+    for stmt in region.stmts: local[stmt.name] = true
+    proc markExternal(node: T) =
+      if cb.isAtomic(node):
+        let name = cb.refName(node)
+        if name.len > 0 and name notin local: used[name] = true
+      else:
+        for child in cb.children(node): markExternal(child)
+    for stmt in region.stmts:
+      markExternal(stmt.rhs)
+      for nested in stmt.nested:
+        markRegionOuterUses(nested, local)
+    markExternal(region.result)
   markUsed(prog.result)
   var kept: seq[AnfBinding[T]] = @[]
   for i in countdown(prog.stmts.high, 0):
@@ -241,6 +280,7 @@ proc dceAnf*[T](prog: AnfProg[T]; cb: AnfCallbacks[T]): AnfProg[T] =
       var keptStmt = stmt
       for j in 0 ..< keptStmt.nested.len:
         keptStmt.nested[j] = dceAnf(keptStmt.nested[j], cb)
+        markRegionOuterUses(keptStmt.nested[j], initTable[string, bool]())
       kept.insert(keptStmt, 0)
   AnfProg[T](stmts: kept, result: prog.result)
 
