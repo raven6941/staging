@@ -206,9 +206,9 @@ when isMainModule:
     const balNs = [100, 300, 1000, 3000, 10000]
     const loopNs = [100, 300, 1000, 3000, 5000]
   else:
-    const chainNs = [100, 1000]
-    const balNs = [100, 1000]
-    const loopNs = [100, 1000]
+    const chainNs = [100, 300]
+    const balNs = [100, 300]
+    const loopNs = [100, 300]
   for n in chainNs:
     runRow("chain", n, proc(): Expr = buildChain(n))
   for n in balNs:
