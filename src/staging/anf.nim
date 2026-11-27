@@ -24,14 +24,26 @@
 ## working unchanged. `dceAnf` drops bindings nothing references — one
 ## backward walk, since a binding only mentions earlier bindings.
 ##
+## Regions: when `isBoundary` is supplied, each boundary node's children
+## normalize into nested regions attached to the binding (`nested` on
+## `AnfBinding`), so a binding named inside a loop/fun body never appears
+## in the enclosing list. `cseAnf`/`dceAnf`/`optAnf` run per region; a
+## duplicate is never merged across a boundary when it mentions a binder.
+## With no boundary callback the behaviour is exactly the old flat list.
+##
 ## Soundness notes for clients:
 ## - `key` must distinguish nodes structurally, including child reference
 ##   names; two bindings with equal keys are the same computation.
-## - CSE is sound only for pure bindings. An effectful nullary node (a
-##   `read()` with no children) must get a distinct key per occurrence,
-##   or the client must keep it out of CSE; otherwise two reads would
-##   collapse into one. `isAtomic` lets the client force such a node to
-##   be bound (never inlined as an atom) even though it has no children.
+## - Effect discipline: with `isPure` supplied, an effectful binding is
+##   a root — never merged by `cseAnf`, never dropped by `dceAnf` — and a
+##   binding whose right-hand side transitively contains an effect is
+##   likewise a root; `optAnf` never applies a rule to a binding whose
+##   nested region contains an effect. Without `isPure` the old client
+##   obligation stands: an effectful nullary node (a `read()` with no
+##   children) must get a distinct key per occurrence, or the client must
+##   keep it out of CSE; otherwise two reads would collapse into one.
+##   `isAtomic` lets the client force such a node to be bound (never
+##   inlined as an atom) even though it has no children.
 ## - A rewrite rule must return an atom (literal, input, or reference)
 ##   or its input unchanged; returning a composite node is a client bug
 ##   and is asserted against.
@@ -46,14 +58,46 @@ type
     isAtomic*: proc(node: T): bool
     refName*: proc(node: T): string
     makeRef*: proc(name: string): T
-
-  AnfBinding*[T] = object
-    name*: string
-    rhs*: T
+    isBoundary*: proc(node: T): bool
+    binders*: proc(node: T): seq[string]
+    freeVars*: proc(node: T): seq[string]
+    isPure*: proc(node: T): bool
 
   AnfProg*[T] = object
     stmts*: seq[AnfBinding[T]]
     result*: T
+
+  AnfBinding*[T] = object
+    name*: string
+    rhs*: T
+    ## One nested region per child of a boundary RHS.  The corresponding
+    ## child in rhs is the result of that region.  Keeping this metadata on
+    ## the binding avoids introducing a second client IR while making region
+    ## boundaries explicit to all ANF passes.
+    nested*: seq[AnfProg[T]]
+
+proc hasEffect[T](node: T; cb: AnfCallbacks[T]): bool =
+  if not cb.isPure.isNil and not cb.isPure(node): return true
+  for child in cb.children(node):
+    if hasEffect(child, cb): return true
+  false
+
+proc effectNames[T](prog: AnfProg[T]; cb: AnfCallbacks[T]): Table[string, bool] =
+  var effects = initTable[string, bool]()
+  proc rhsEffectful(node: T): bool =
+    if not cb.isPure.isNil and not cb.isPure(node): return true
+    if cb.isAtomic(node):
+      let name = cb.refName(node)
+      return name.len > 0 and name in effects
+    for child in cb.children(node):
+      if rhsEffectful(child): return true
+    false
+  for stmt in prog.stmts:
+    var effectful = rhsEffectful(stmt.rhs)
+    for region in stmt.nested:
+      if effectNames(region, cb).len > 0: effectful = true
+    if effectful: effects[stmt.name] = true
+  effects
 
 proc substRefs*[T](node: T; subst: Table[string, T];
                    cb: AnfCallbacks[T]): T =
@@ -77,19 +121,28 @@ proc toAnf*[T](root: T; cb: AnfCallbacks[T];
   ## Name every composite subexpression. Each binding's right-hand side
   ## has only atomic children; the result is an atom or a reference.
   var counter = 0
-  var prog = AnfProg[T](stmts: @[])
-  proc norm(node: T): T =
+  proc norm(node: T; prog: var AnfProg[T]): T =
     if cb.isAtomic(node):
       return node
     var kids: seq[T] = @[]
+    var nested: seq[AnfProg[T]] = @[]
+    let region = not cb.isBoundary.isNil and cb.isBoundary(node)
     for child in cb.children(node):
-      kids.add(norm(child))
+      if region:
+        var childProg = AnfProg[T](stmts: @[])
+        let childResult = norm(child, childProg)
+        childProg.result = childResult
+        kids.add(childResult)
+        nested.add(childProg)
+      else:
+        kids.add(norm(child, prog))
     let rebuilt = cb.rebuild(node, kids)
     let name = prefix & $counter
     inc counter
-    prog.stmts.add(AnfBinding[T](name: name, rhs: rebuilt))
+    prog.stmts.add(AnfBinding[T](name: name, rhs: rebuilt, nested: nested))
     cb.makeRef(name)
-  prog.result = norm(root)
+  var prog = AnfProg[T](stmts: @[])
+  prog.result = norm(root, prog)
   prog
 
 proc fromAnf*[T](prog: AnfProg[T]; cb: AnfCallbacks[T]): T =
@@ -98,7 +151,16 @@ proc fromAnf*[T](prog: AnfProg[T]; cb: AnfCallbacks[T]): T =
   var result = prog.result
   var subst = initTable[string, T]()
   for i in countdown(prog.stmts.high, 0):
-    let stmt = prog.stmts[i]
+    var stmt = prog.stmts[i]
+    if stmt.nested.len > 0:
+      var kids: seq[T] = @[]
+      let originalKids = cb.children(stmt.rhs)
+      for j, child in originalKids:
+        if j < stmt.nested.len:
+          kids.add(fromAnf(stmt.nested[j], cb))
+        else:
+          kids.add(child)
+      stmt.rhs = cb.rebuild(stmt.rhs, kids)
     subst[stmt.name] = stmt.rhs
     result = substRefs(result, subst, cb)
   result
@@ -110,14 +172,24 @@ proc cseAnf*[T](prog: AnfProg[T]; cb: AnfCallbacks[T]): AnfProg[T] =
   var seen = initTable[string, string]()
   var aliases = initTable[string, T]()
   var outProg = AnfProg[T](stmts: @[])
+  let effects = effectNames(prog, cb)
   for stmt in prog.stmts:
+    var nested: seq[AnfProg[T]] = @[]
+    for region in stmt.nested:
+      nested.add(cseAnf(region, cb))
     let rhs = substRefs(stmt.rhs, aliases, cb)
     let k = cb.key(rhs)
-    if k in seen:
-      aliases[stmt.name] = cb.makeRef(seen[k])
+    let effectful = stmt.name in effects
+    if k in seen or effectful:
+      if effectful:
+        outProg.stmts.add(AnfBinding[T](name: stmt.name, rhs: rhs,
+                                        nested: nested))
+      else:
+        aliases[stmt.name] = cb.makeRef(seen[k])
     else:
       seen[k] = stmt.name
-      outProg.stmts.add(AnfBinding[T](name: stmt.name, rhs: rhs))
+      outProg.stmts.add(AnfBinding[T](name: stmt.name, rhs: rhs,
+                                      nested: nested))
   outProg.result = substRefs(prog.result, aliases, cb)
   outProg
 
@@ -127,6 +199,7 @@ proc dceAnf*[T](prog: AnfProg[T]; cb: AnfCallbacks[T]): AnfProg[T] =
   ## earlier bindings, so a name is live iff it is used by the result or
   ## by a kept later binding.
   var used = initTable[string, bool]()
+  let effects = effectNames(prog, cb)
   proc markUsed(node: T) =
     if cb.isAtomic(node):
       let name = cb.refName(node)
@@ -137,9 +210,12 @@ proc dceAnf*[T](prog: AnfProg[T]; cb: AnfCallbacks[T]): AnfProg[T] =
   var kept: seq[AnfBinding[T]] = @[]
   for i in countdown(prog.stmts.high, 0):
     let stmt = prog.stmts[i]
-    if stmt.name in used:
+    if stmt.name in used or stmt.name in effects:
       markUsed(stmt.rhs)
-      kept.insert(stmt, 0)
+      var keptStmt = stmt
+      for j in 0 ..< keptStmt.nested.len:
+        keptStmt.nested[j] = dceAnf(keptStmt.nested[j], cb)
+      kept.insert(keptStmt, 0)
   AnfProg[T](stmts: kept, result: prog.result)
 
 proc optAnf*[T](prog: AnfProg[T]; cb: AnfCallbacks[T];
@@ -152,13 +228,25 @@ proc optAnf*[T](prog: AnfProg[T]; cb: AnfCallbacks[T];
   var aliases = initTable[string, T]()
   var outProg = AnfProg[T](stmts: @[])
   for stmt in prog.stmts:
+    var nested: seq[AnfProg[T]] = @[]
+    for region in stmt.nested:
+      nested.add(optAnf(region, cb, rule))
+    # A rewrite that replaces a boundary binding's right-hand side with
+    # an atom discards its nested regions, so it must never fire when a
+    # region contains an effect: the region's bindings exist nowhere
+    # else, and dropping them would delete the effect. Pure regions
+    # still rewrite (that is the point of the rule).
+    var regionEffect = false
+    for region in nested:
+      if effectNames(region, cb).len > 0: regionEffect = true
     let rhs = substRefs(stmt.rhs, aliases, cb)
-    let rewritten = rule(rhs)
+    let rewritten = if regionEffect: rhs else: rule(rhs)
     if rewritten == rhs:
       ## `==` is identity for ref nodes and structural equality for
       ## value nodes; either way a rule returning an equal node means
       ## no rewrite, which is always a safe reading.
-      outProg.stmts.add(AnfBinding[T](name: stmt.name, rhs: rhs))
+      outProg.stmts.add(AnfBinding[T](name: stmt.name, rhs: rhs,
+                                      nested: nested))
     else:
       doAssert cb.isAtomic(rewritten),
         "ANF rewrite must return an atom or its input unchanged"

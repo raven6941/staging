@@ -2,7 +2,7 @@ import staging/anf
 import std/[tables]
 
 type
-  ExprKind = enum ekLit, ekInput, ekRef, ekAdd, ekMul
+  ExprKind = enum ekLit, ekInput, ekRef, ekAdd, ekMul, ekLoop, ekEffect
   Expr = ref object
     kind: ExprKind
     value: int
@@ -14,16 +14,20 @@ proc input(name: string): Expr = Expr(kind: ekInput, name: name)
 proc refE(name: string): Expr = Expr(kind: ekRef, name: name)
 proc add(a, b: Expr): Expr = Expr(kind: ekAdd, left: a, right: b)
 proc mul(a, b: Expr): Expr = Expr(kind: ekMul, left: a, right: b)
+proc loop(body: Expr): Expr = Expr(kind: ekLoop, left: body)
+proc effect(): Expr = Expr(kind: ekEffect)
 
 proc exprChildren(e: Expr): seq[Expr] =
   case e.kind
   of ekAdd, ekMul: @[e.left, e.right]
+  of ekLoop: @[e.left]
   else: @[]
 
 proc exprRebuild(e: Expr; kids: seq[Expr]): Expr =
   case e.kind
   of ekAdd: add(kids[0], kids[1])
   of ekMul: mul(kids[0], kids[1])
+  of ekLoop: loop(kids[0])
   else: e
 
 proc exprKey(e: Expr): string =
@@ -33,6 +37,8 @@ proc exprKey(e: Expr): string =
   of ekRef: "ref(" & e.name & ")"
   of ekAdd: "add(" & exprKey(e.left) & "," & exprKey(e.right) & ")"
   of ekMul: "mul(" & exprKey(e.left) & "," & exprKey(e.right) & ")"
+  of ekLoop: "loop(" & exprKey(e.left) & ")"
+  of ekEffect: "effect"
 
 proc exprIsAtomic(e: Expr): bool =
   e.kind in {ekLit, ekInput, ekRef}
@@ -54,6 +60,8 @@ proc evalExpr(e: Expr; env: Table[string, int]): int =
   of ekInput, ekRef: env[e.name]
   of ekAdd: evalExpr(e.left, env) + evalExpr(e.right, env)
   of ekMul: evalExpr(e.left, env) * evalExpr(e.right, env)
+  of ekLoop: evalExpr(e.left, env)
+  of ekEffect: 99
 
 proc arithOpt(e: Expr): Expr =
   ## ArithExpOpt-style: identities + constant folding, visible directly
@@ -119,5 +127,52 @@ when isMainModule:
   doAssert evalExpr(rt, env) == evalExpr(nested, env)
   doAssert evalExpr(rt, {"a": 7, "b": 11}.toTable) ==
     evalExpr(nested, {"a": 7, "b": 11}.toTable)
+
+  # Boundary regions keep loop-body bindings out of the enclosing region.
+  let boundaryCb = AnfCallbacks[Expr](
+    children: exprChildren, rebuild: exprRebuild, key: exprKey,
+    isAtomic: exprIsAtomic, refName: exprRefName, makeRef: refE,
+    isBoundary: proc(e: Expr): bool = e.kind == ekLoop,
+    binders: proc(e: Expr): seq[string] = @["i"],
+    freeVars: proc(e: Expr): seq[string] = @[],
+    isPure: proc(e: Expr): bool = e.kind != ekEffect)
+  let loopProg = toAnf(loop(add(input("a"), input("b"))), boundaryCb)
+  doAssert loopProg.stmts.len == 1
+  doAssert loopProg.stmts[0].nested.len == 1
+  doAssert loopProg.stmts[0].nested[0].stmts.len == 1
+  doAssert evalExpr(fromAnf(loopProg, boundaryCb), env) == 8
+  let cross = cseAnf(toAnf(add(loop(add(input("a"), input("b"))),
+                              add(input("a"), input("b"))), boundaryCb),
+                     boundaryCb)
+  doAssert cross.stmts.len == 3
+  doAssert cross.stmts[0].nested[0].stmts.len == 1
+
+  # Effects are roots, including through a pure binding that refers to one.
+  let effectProg = toAnf(add(effect(), lit(1)), boundaryCb)
+  doAssert dceAnf(effectProg, boundaryCb).stmts.len == 2
+  doAssert cseAnf(toAnf(add(effect(), effect()), boundaryCb), boundaryCb).
+    stmts.len == 3
+
+  # An effect made unreferenced by a rewrite is still kept by DCE:
+  # `effect() * 0` folds to 0, but the read must still happen.
+  let zeroedEffect = dceAnf(optAnf(
+    toAnf(mul(effect(), lit(0)), boundaryCb), boundaryCb, arithOpt),
+    boundaryCb)
+  doAssert zeroedEffect.stmts.len == 1
+  doAssert evalExpr(fromAnf(zeroedEffect, boundaryCb), env) == 0
+
+  # A rule rewriting a loop node away must not discard an effect inside
+  # the loop body; a pure loop body still rewrites.
+  proc loopDrop(e: Expr): Expr =
+    if e.kind == ekLoop: lit(0) else: e
+  let droppedLoop = optAnf(
+    toAnf(loop(add(effect(), lit(1))), boundaryCb), boundaryCb, loopDrop)
+  doAssert droppedLoop.stmts.len == 1
+  doAssert droppedLoop.stmts[0].nested[0].stmts.len == 2
+  doAssert evalExpr(fromAnf(droppedLoop, boundaryCb), env) == 100
+  let droppedPureLoop = optAnf(
+    toAnf(loop(add(input("a"), lit(1))), boundaryCb), boundaryCb, loopDrop)
+  doAssert droppedPureLoop.stmts.len == 0
+  doAssert evalExpr(fromAnf(droppedPureLoop, boundaryCb), env) == 0
 
   echo "ok: ANF conversion, ArithExpOpt rewrite, and stencil CSE"
