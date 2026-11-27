@@ -199,7 +199,7 @@ the residual is runnable. What exists today:
   front end — scans, filters, group-by, ORDER BY, LIMIT/OFFSET, DISTINCT,
   aggregates (including string min/max), and IN / EXISTS / NOT IN /
   NOT EXISTS subqueries with HAVING.
-- **LINQ (in progress):** a staged LINQ core — `Database` / `DBFor` nodes
+- **LINQ:** a staged LINQ core — `Database` / `DBFor` nodes
   with `dbfor` normalization, dynamic predicates, and nested comprehensions.
   SQL emission is out of scope.
 
@@ -219,7 +219,7 @@ or clone and use `--path:src`.
 nimble test
 ```
 
-Runs 46 test files, each a standalone `nim c -r` of one facility or port;
+Runs 47 test files, each a standalone `nim c -r` of one facility or port;
 the codegen tests additionally compile and run their emitted residual
 programs. CI runs `nimble test` on ubuntu-latest with Nim 2.0.8, 2.2.12,
 and 2.4.0, and on macos-latest with Nim 2.2.12.
@@ -245,6 +245,10 @@ Honest boundaries, not roadmap promises:
   to `GTree`; use `GTree` when the generic representation is simpler. Both
   forms use the same hoist-every rule, treat `let` binders as sharing boundaries,
   and honor `isPure`: nil means pure, while false marks a sharing boundary.
+  The callbacks also carry an optional `isTotal`: nil keeps the lenient
+  pure-only default, and a node it marks non-total is never hoisted across
+  a sharing boundary. As with `isPure`, totality is a client attestation,
+  not something the framework infers.
   The classification's long-term home (callbacks or a framework-level node
   tag) remains open until another consumer needs it.
 - **No built-in runtime codegen, graph IR, or optimization passes beyond
@@ -262,8 +266,10 @@ Honest boundaries, not roadmap promises:
 
 The relational facilities the library was extracted to support have largely
 landed (`branch_policy`, `modes`, relational genlet, `specctx`). The
-current work is the tutorial tail: the staged SQL front end and the LINQ
-core, filed as issues and worked through in order. The engine
+tutorial tail is done too: the staged SQL front end and the LINQ core are
+complete (SQL emission out of scope). The recent work is the ANF/traversal
+passes — boundary-aware ANF, CSE/DCE, loop-invariant code motion, and
+effect/totality attestation — filed as issues and worked through in order. The engine
 ([raven6941/minikanren](https://github.com/raven6941/minikanren)) stands
 alone with no staging dependency for now, and may eventually depend on this
 library.
