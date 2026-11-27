@@ -153,3 +153,36 @@ when isMainModule:
   doAssert pureContainCtx.counter == 3
   echo "ok: pure candidate containing an effect is not hoisted; pure twin is"
 
+  # Totality only constrains crossing a boundary. With freeVars supplied,
+  # globalOccurrences records the binder context for each occurrence.
+  let diverging = gnode("diverge", @[gatom("2"), gatom("3")])
+  var totalCb = gtreeCallbacks()
+  totalCb.isTotal = proc(n: GTree): bool = n.kind != gkNode or n.op != "diverge"
+  let acrossDiverge = gnode("add", @[
+    glet("z", diverging, gatom("0")), diverging])
+  var divergeCtx = newGenletCtx()
+  let divergeOut = insertLetsCb(acrossDiverge, divergeCtx, totalCb)
+  doAssert divergeCtx.counter == 0
+  let totalTerm = gnode("total", @[gatom("2"), gatom("3")])
+  let acrossTotal = gnode("add", @[
+    glet("z", totalTerm, gatom("0")), totalTerm])
+  var totalCtx = newGenletCtx()
+  discard insertLetsCb(acrossTotal, totalCtx, totalCb)
+  doAssert totalCtx.counter == 1
+  echo "ok: totality blocks only cross-boundary diverging hoists"
+
+  # With freeVars nil there are no occurrence contexts, so the
+  # cross-boundary totality check must not touch them — and a
+  # same-region hoist of a diverging term is sound and still happens
+  # (occurrences stops at boundaries, so nothing crosses one).
+  var noFreeVarsCb = gtreeCallbacks()
+  noFreeVarsCb.freeVars = nil
+  noFreeVarsCb.isTotal = proc(n: GTree): bool =
+    n.kind != gkNode or n.op != "diverge"
+  let sameRegion = gnode("add", @[diverging, diverging])
+  var sameRegionCtx = newGenletCtx()
+  let sameRegionOut = insertLetsCb(sameRegion, sameRegionCtx, noFreeVarsCb)
+  doAssert sameRegionCtx.counter == 1
+  doAssert count($sameRegionOut, "diverge(2, 3)") == 1
+  echo "ok: nil freeVars + isTotal does not crash; same-region hoist stands"
+

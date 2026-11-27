@@ -16,6 +16,8 @@ type
     binders*: proc(node: T): seq[string]
     freeVars*: proc(node: T): seq[string]
     isPure*: proc(node: T): bool
+    ## Optional totality attestation. Nil means no node is non-total.
+    isTotal*: proc(node: T): bool
 
   ## Compatibility name retained for clients of genlet's original API.
   GenletCallbacks*[T] = TraversalCallbacks[T]
@@ -39,9 +41,19 @@ proc containsEffect*[T](node: T; cb: TraversalCallbacks[T]): bool =
     if containsEffect(child, cb): return true
   false
 
+proc containsNonTotal*[T](node: T; cb: TraversalCallbacks[T]): bool =
+  ## True when node or any node in its subtree is marked as possibly
+  ## diverging. A nil query preserves the lenient pure-only behaviour.
+  if not cb.isTotal.isNil and not cb.isTotal(node): return true
+  for child in cb.children(node):
+    if containsNonTotal(child, cb): return true
+  false
+
 proc isSharingBoundary*[T](node: T; cb: TraversalCallbacks[T]): bool =
   ## Effect annotations are deliberately only a genlet/traversal concern for
-  ## now.  A missing query preserves the historical all-pure behaviour.
+  ## now. A missing `isPure` query preserves the historical all-pure
+  ## behaviour; a missing `isTotal` query is likewise lenient and leaves
+  ## totality as the client's obligation where a consumer needs it.
   cb.isBoundary(node) or isEffectful(node, cb)
 
 proc intersects(a: seq[string]; scope: HashSet[string]): bool =

@@ -2,7 +2,8 @@ import staging/anf
 import std/[tables]
 
 type
-  ExprKind = enum ekLit, ekInput, ekRef, ekAdd, ekMul, ekLoop, ekEffect, ekRead
+  ExprKind = enum ekLit, ekInput, ekRef, ekAdd, ekMul, ekLoop, ekEffect, ekRead,
+    ekDiverge
   Expr = ref object
     kind: ExprKind
     value: int
@@ -17,6 +18,7 @@ proc mul(a, b: Expr): Expr = Expr(kind: ekMul, left: a, right: b)
 proc loop(body: Expr): Expr = Expr(kind: ekLoop, left: body)
 proc effect(): Expr = Expr(kind: ekEffect)
 proc readVar(): Expr = Expr(kind: ekRead)
+proc diverge(): Expr = Expr(kind: ekDiverge)
 
 proc exprChildren(e: Expr): seq[Expr] =
   case e.kind
@@ -41,6 +43,7 @@ proc exprKey(e: Expr): string =
   of ekLoop: "loop(" & exprKey(e.left) & ")"
   of ekEffect: "effect"
   of ekRead: "read"
+  of ekDiverge: "diverge"
 
 proc exprIsAtomic(e: Expr): bool =
   e.kind in {ekLit, ekInput, ekRef}
@@ -63,7 +66,7 @@ proc evalExpr(e: Expr; env: Table[string, int]): int =
   of ekAdd: evalExpr(e.left, env) + evalExpr(e.right, env)
   of ekMul: evalExpr(e.left, env) * evalExpr(e.right, env)
   of ekLoop: evalExpr(e.left, env)
-  of ekEffect, ekRead: 99
+  of ekEffect, ekRead, ekDiverge: 99
 
 proc arithOpt(e: Expr): Expr =
   ## ArithExpOpt-style: identities + constant folding, visible directly
@@ -169,10 +172,34 @@ when isMainModule:
   doAssert zeroedEffect.stmts.len == 1
   doAssert evalExpr(fromAnf(zeroedEffect, boundaryCb), env) == 0
 
+  # Totality is a separate attestation from purity: folding diverge() * 0
+  # must not delete the diverging binding.
+  var totalCb = boundaryCb
+  totalCb.isTotal = proc(e: Expr): bool = e.kind != ekDiverge
+  let zeroedDiverge = dceAnf(optAnf(
+    toAnf(mul(diverge(), lit(0)), totalCb), totalCb, arithOpt), totalCb)
+  doAssert zeroedDiverge.stmts.len == 1
+  # CSE remains pure-only: identical diverging occurrences still merge.
+  doAssert cseAnf(toAnf(add(diverge(), diverge()), totalCb), totalCb).
+    stmts.len == 2
+
+  # Nil isTotal is deliberately lenient: existing isPure-only clients retain
+  # old DCE behaviour, and must attest totality when they have diverging nodes.
+  let lenientDiverge = dceAnf(optAnf(
+    toAnf(mul(diverge(), lit(0)), boundaryCb), boundaryCb, arithOpt),
+    boundaryCb)
+  doAssert lenientDiverge.stmts.len == 0
+
   # A rule rewriting a loop node away must not discard an effect inside
   # the loop body; a pure loop body still rewrites.
   proc loopDrop(e: Expr): Expr =
     if e.kind == ekLoop: lit(0) else: e
+  # A non-total nested region blocks the boundary rewrite, just like an
+  # effectful region does.
+  let droppedDivergeLoop = optAnf(
+    toAnf(loop(diverge()), totalCb), totalCb, loopDrop)
+  doAssert droppedDivergeLoop.stmts.len == 1
+  doAssert droppedDivergeLoop.stmts[0].nested[0].stmts.len == 1
   let droppedLoop = optAnf(
     toAnf(loop(add(effect(), lit(1))), boundaryCb), boundaryCb, loopDrop)
   doAssert droppedLoop.stmts.len == 1
@@ -226,6 +253,10 @@ when isMainModule:
 
   let effectBody = licmAnf(toAnf(loop(effect()), licmCb), licmCb)
   doAssert effectBody.stmts[0].nested[0].stmts.len == 1
+  var divergeLicmCb = licmCb
+  divergeLicmCb.isTotal = proc(e: Expr): bool = e.kind != ekDiverge
+  let divergeBody = licmAnf(toAnf(loop(diverge()), divergeLicmCb), divergeLicmCb)
+  doAssert divergeBody.stmts[0].nested[0].stmts.len == 1
   var unsafePure = licmCb
   unsafePure.isPure = proc(e: Expr): bool = true
   doAssert licmAnf(toAnf(loop(effect()), unsafePure), unsafePure).
