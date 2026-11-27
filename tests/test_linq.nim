@@ -1,6 +1,6 @@
 import staging/framework
 import staging/traversal
-import std/[os, osproc, strutils, tables, times]
+import std/[os, osproc, strutils, tables, times, sequtils]
 
 type
   Person = object
@@ -27,6 +27,11 @@ type
     departments: seq[OrgDpt]
     employees: seq[OrgEmp]
     tasks: seq[OrgTask]
+  NodeRow = object
+    id, parent, pre, post: Rep[int]
+    name: Rep[string]
+  XmlDB = object
+    nodes: seq[NodeRow]
   EmptyRow = object
   NameRow = object
     name: Rep[string]
@@ -141,6 +146,11 @@ proc empDptOf(x: Rep[EmpRow]): Rep[string] = orgField[EmpRow, string](x, "dpt")
 proc empOf(x: Rep[EmpRow]): Rep[string] = orgField[EmpRow, string](x, "emp")
 proc taskEmpOf(x: Rep[TaskRow]): Rep[string] = orgField[TaskRow, string](x, "emp")
 proc taskNameOf(x: Rep[TaskRow]): Rep[string] = orgField[TaskRow, string](x, "tsk")
+proc nodeId(x: Rep[NodeRow]): Rep[int] = orgField[NodeRow, int](x, "id")
+proc nodeParent(x: Rep[NodeRow]): Rep[int] = orgField[NodeRow, int](x, "parent")
+proc nodePre(x: Rep[NodeRow]): Rep[int] = orgField[NodeRow, int](x, "pre")
+proc nodePost(x: Rep[NodeRow]): Rep[int] = orgField[NodeRow, int](x, "post")
+proc nodeName(x: Rep[NodeRow]): Rep[string] = orgField[NodeRow, string](x, "name")
 proc dptValue(x: Rep[string]): Rep[DptRow] = dynamic[DptRow](DptValueNode(dpt: x))
 proc nestedDptValue(dpt: Rep[string], employees: Rep[seq[NestedEmpRow]]): Rep[NestedDptRow] =
   dynamic[NestedDptRow](NestedDptValueNode(dpt: dpt, employees: employees))
@@ -262,6 +272,62 @@ proc all[T](xs: Rep[seq[T]], p: proc(x: Rep[T]): Rep[bool] {.closure.}): Rep[boo
   notR(any(xs, proc(x: Rep[T]): Rep[bool] {.closure.} = notR(p(x))))
 proc contains(xs: Rep[seq[string]], u: Rep[string]): Rep[bool] =
   any(xs, proc(x: Rep[string]): Rep[bool] {.closure.} = eqR(x, u))
+type
+  AxisKind = enum akSelf, akChild, akDescendant, akDescendantOrSelf, akFollowing, akFollowingSibling, akRev
+  Axis = ref object
+    case kind: AxisKind
+    of akRev: reversed: Axis
+    else: discard
+  PathKind = enum PSeqKind, PAxisKind, NameTestKind, FilterKind
+  Path = ref object
+    case kind: PathKind
+    of PSeqKind: p, q: Path
+    of PAxisKind: ax: Axis
+    of NameTestKind: testName: string
+    of FilterKind: filtered: Path
+
+proc selfAxis(): Axis = Axis(kind: akSelf)
+proc childAxis(): Axis = Axis(kind: akChild)
+proc descendantAxis(): Axis = Axis(kind: akDescendant)
+proc descendantOrSelfAxis(): Axis = Axis(kind: akDescendantOrSelf)
+proc followingAxis(): Axis = Axis(kind: akFollowing)
+proc followingSiblingAxis(): Axis = Axis(kind: akFollowingSibling)
+proc Rev(a: Axis): Axis = Axis(kind: akRev, reversed: a)
+proc parent(): Path = Path(kind: PAxisKind, ax: Rev(childAxis()))
+proc ancestor(): Path = Path(kind: PAxisKind, ax: Rev(descendantAxis()))
+proc preceding(): Path = Path(kind: PAxisKind, ax: Rev(followingAxis()))
+proc PSeq(p, q: Path): Path = Path(kind: PSeqKind, p: p, q: q)
+proc PAxis(a: Axis): Path = Path(kind: PAxisKind, ax: a)
+proc NameTest(s: string): Path = Path(kind: NameTestKind, testName: s)
+proc Filter(p: Path): Path = Path(kind: FilterKind, filtered: p)
+
+let db_xml = database[XmlDB]("xml")
+proc axis(a: Axis, s, t: Rep[NodeRow]): Rep[bool] =
+  case a.kind
+  of akSelf: eqR(nodeId(s), nodeId(t))
+  of akChild: eqR(nodeId(s), nodeParent(t))
+  of akDescendant: andR(ltR(nodePre(s), nodePre(t)), ltR(nodePost(t), nodePost(s)))
+  of akDescendantOrSelf: andR(leR(nodePre(s), nodePre(t)), leR(nodePost(t), nodePost(s)))
+  of akFollowing: ltR(nodePre(s), nodePre(t))
+  of akFollowingSibling: andR(ltR(nodePost(s), nodePre(t)), eqR(nodeParent(s), nodeParent(t)))
+  of akRev: axis(a.reversed, t, s)
+
+proc path(p: Path, s, u: Rep[NodeRow]): Rep[bool] =
+  case p.kind
+  of PSeqKind:
+    any(table[NodeRow, XmlDB](db_xml, "nodes"), proc(t: Rep[NodeRow]): Rep[bool] {.closure.} =
+      andR(path(p.p, s, t), path(p.q, t, u)))
+  of PAxisKind: axis(p.ax, s, u)
+  of NameTestKind: andR(eqR(nodeId(s), nodeId(u)), eqR(nodeName(u), liftNow(p.testName)))
+  of FilterKind:
+    andR(eqR(nodeId(s), nodeId(u)), any(table[NodeRow, XmlDB](db_xml, "nodes"),
+      proc(t: Rep[NodeRow]): Rep[bool] {.closure.} = path(p.filtered, s, t)))
+
+proc xpath(p: Path): Rep[seq[int]] =
+  listFlatMap(table[NodeRow, XmlDB](db_xml, "nodes"), proc(root: Rep[NodeRow]): Rep[seq[int]] {.closure.} =
+    listMap(listFilter(table[NodeRow, XmlDB](db_xml, "nodes"), proc(s: Rep[NodeRow]): Rep[bool] {.closure.} =
+      andR(eqR(nodeParent(root), liftNow(-1)), path(p, root, s))),
+      proc(s: Rep[NodeRow]): Rep[int] {.closure.} = nodeId(s)))
 let db = database[PeopleDB]("db")
 proc satisfies(p: proc(x: Rep[int]): Rep[bool] {.closure.}): Rep[seq[NameRow]] =
   listMap(listFilter(people(db), proc(x: Rep[PersonRow]): Rep[bool] {.closure.} = p(ageOf(x))),
@@ -314,7 +380,7 @@ proc emitString(r: Rep[string]): string
 proc emitBool(r: Rep[bool]): string
 proc emitInt(r: Rep[int]): string =
   if r.isStatic: return $r.staticVal
-  if r.node of FieldNode: return FieldNode(r.node).binder & ".age"
+  if r.node of FieldNode: return FieldNode(r.node).binder & "." & FieldNode(r.node).field
   let n = ScalarNode[int](r.node)
   case n.kind
   of skAdd: "(" & emitInt(n.left) & " + " & emitInt(n.right) & ")"
@@ -329,6 +395,7 @@ proc emitBool(r: Rep[bool]): string =
   if r.node of ScalarNode[int]:
     let n = ScalarNode[int](r.node)
     let op = case n.kind
+      of skEq: " == "
       of skLt: " < "
       of skLe: " <= "
       of skGt: " > "
@@ -350,7 +417,7 @@ proc emitBoolHoisted(r: Rep[bool], indent: string): tuple[pre, expr: string]
 proc emitExistsStrings(r: Rep[seq[string]], indent, flag: string): string =
   if r.node of DBForNode[string]:
     let n = DBForNode[string](r.node)
-    return indent & "for " & n.binder & " in org." & n.table & ":\n" & emitExistsStrings(n.body, indent & "  ", flag)
+    return indent & "for " & n.binder & " in " & n.sourceDb & "." & n.table & ":\n" & emitExistsStrings(n.body, indent & "  ", flag)
   let n = ListNode[string](r.node)
   case n.kind
   of lkEmpty: ""
@@ -362,7 +429,7 @@ proc emitExistsStrings(r: Rep[seq[string]], indent, flag: string): string =
 proc emitExistsNestedEmps(r: Rep[seq[NestedEmpRow]], indent, flag: string): string =
   if r.node of DBForNode[NestedEmpRow]:
     let n = DBForNode[NestedEmpRow](r.node)
-    return indent & "for " & n.binder & " in org." & n.table & ":\n" & emitExistsNestedEmps(n.body, indent & "  ", flag)
+    return indent & "for " & n.binder & " in " & n.sourceDb & "." & n.table & ":\n" & emitExistsNestedEmps(n.body, indent & "  ", flag)
   let n = ListNode[NestedEmpRow](r.node)
   case n.kind
   of lkEmpty: ""
@@ -374,7 +441,7 @@ proc emitExistsNestedEmps(r: Rep[seq[NestedEmpRow]], indent, flag: string): stri
 proc emitEmpty(r: Rep[seq[EmptyRow]], indent: string, flag: string): string =
   if r.node of DBForNode[EmptyRow]:
     let n = DBForNode[EmptyRow](r.node)
-    return indent & "for " & n.binder & " in org." & n.table & ":\n" &
+    return indent & "for " & n.binder & " in " & n.sourceDb & "." & n.table & ":\n" &
       emitEmpty(n.body, indent & "  ", flag)
   let n = ListNode[EmptyRow](r.node)
   case n.kind
@@ -426,7 +493,7 @@ proc emitNames(r: Rep[seq[NameRow]], outName, indent: string): string =
   if r.isStatic: return ""
   if r.node of DBForNode[NameRow]:
     let n = DBForNode[NameRow](r.node)
-    return indent & "for " & n.binder & " in db." & n.table & ":\n" & emitNames(n.body, outName, indent & "  ")
+    return indent & "for " & n.binder & " in " & n.sourceDb & "." & n.table & ":\n" & emitNames(n.body, outName, indent & "  ")
   let n = ListNode[NameRow](r.node)
   case n.kind
   of lkEmpty: ""
@@ -438,7 +505,7 @@ proc emitNames(r: Rep[seq[NameRow]], outName, indent: string): string =
 proc emitInts(r: Rep[seq[int]], outName, indent: string): string =
   if r.node of DBForNode[int]:
     let n = DBForNode[int](r.node)
-    return indent & "for " & n.binder & " in db." & n.table & ":\n" & emitInts(n.body, outName, indent & "  ")
+    return indent & "for " & n.binder & " in " & n.sourceDb & "." & n.table & ":\n" & emitInts(n.body, outName, indent & "  ")
   let n = ListNode[int](r.node)
   case n.kind
   of lkEmpty: ""
@@ -451,7 +518,7 @@ proc emitInts(r: Rep[seq[int]], outName, indent: string): string =
 proc emitDpts(r: Rep[seq[DptRow]], outName, indent: string): string =
   if r.node of DBForNode[DptRow]:
     let n = DBForNode[DptRow](r.node)
-    return indent & "for " & n.binder & " in org." & n.table & ":\n" & emitDpts(n.body, outName, indent & "  ")
+    return indent & "for " & n.binder & " in " & n.sourceDb & "." & n.table & ":\n" & emitDpts(n.body, outName, indent & "  ")
   let n = ListNode[DptRow](r.node)
   case n.kind
   of lkEmpty: ""
@@ -464,7 +531,7 @@ proc emitDpts(r: Rep[seq[DptRow]], outName, indent: string): string =
 proc emitStrings(r: Rep[seq[string]], outName, indent: string): string =
   if r.node of DBForNode[string]:
     let n = DBForNode[string](r.node)
-    return indent & "for " & n.binder & " in org." & n.table & ":\n" & emitStrings(n.body, outName, indent & "  ")
+    return indent & "for " & n.binder & " in " & n.sourceDb & "." & n.table & ":\n" & emitStrings(n.body, outName, indent & "  ")
   let n = ListNode[string](r.node)
   case n.kind
   of lkEmpty: ""
@@ -477,7 +544,7 @@ proc emitStrings(r: Rep[seq[string]], outName, indent: string): string =
 proc emitNestedEmps(r: Rep[seq[NestedEmpRow]], outName, indent: string): string =
   if r.node of DBForNode[NestedEmpRow]:
     let n = DBForNode[NestedEmpRow](r.node)
-    return indent & "for " & n.binder & " in org." & n.table & ":\n" & emitNestedEmps(n.body, outName, indent & "  ")
+    return indent & "for " & n.binder & " in " & n.sourceDb & "." & n.table & ":\n" & emitNestedEmps(n.body, outName, indent & "  ")
   let n = ListNode[NestedEmpRow](r.node)
   case n.kind
   of lkEmpty: ""
@@ -496,7 +563,7 @@ proc emitNestedEmps(r: Rep[seq[NestedEmpRow]], outName, indent: string): string 
 proc emitNestedDpts(r: Rep[seq[NestedDptRow]], outName, indent: string): string =
   if r.node of DBForNode[NestedDptRow]:
     let n = DBForNode[NestedDptRow](r.node)
-    return indent & "for " & n.binder & " in org." & n.table & ":\n" & emitNestedDpts(n.body, outName, indent & "  ")
+    return indent & "for " & n.binder & " in " & n.sourceDb & "." & n.table & ":\n" & emitNestedDpts(n.body, outName, indent & "  ")
   let n = ListNode[NestedDptRow](r.node)
   case n.kind
   of lkEmpty: ""
@@ -525,6 +592,41 @@ proc oracleSatisfies(db: PeopleDB, pred: proc(age: int): bool): seq[string] =
   for p in db.people:
     if pred(p.age): result.add(p.name)
 
+type PlainNode = object
+  id, parent, pre, post: int
+  name: string
+
+proc directAxis(a: Axis, s, t: PlainNode): bool =
+  case a.kind
+  of akSelf: s.id == t.id
+  of akChild: s.id == t.parent
+  of akDescendant: s.pre < t.pre and t.post < s.post
+  of akDescendantOrSelf: s.pre <= t.pre and t.post <= s.post
+  of akFollowing: s.pre < t.pre
+  of akFollowingSibling: s.post < t.pre and s.parent == t.parent
+  of akRev: directAxis(a.reversed, t, s)
+
+proc directPath(p: Path, s, u: PlainNode, xs: seq[PlainNode]): bool =
+  case p.kind
+  of PSeqKind:
+    for t in xs:
+      if directPath(p.p, s, t, xs) and directPath(p.q, t, u, xs): return true
+    false
+  of PAxisKind: directAxis(p.ax, s, u)
+  of NameTestKind: s.id == u.id and s.name == p.testName
+  of FilterKind:
+    if s.id != u.id: false
+    else:
+      for t in xs:
+        if directPath(p.filtered, s, t, xs): return true
+      false
+
+proc directXpath(p: Path, xs: seq[PlainNode]): seq[int] =
+  for root in xs:
+    if root.parent == -1:
+      for s in xs:
+        if directPath(p, root, s, xs): result.add(s.id)
+
 proc compileRun(src: string): string =
   let dir = getTempDir() / ("linq-" & $epochTime().int & "-" & $funCounter)
   createDir(dir); let path = dir / "main.nim"; let exe = dir / "main"
@@ -543,6 +645,9 @@ proc linqChildren(n: IRNode): seq[IRNode] =
     if not d.body.isStatic: result.add(d.body.node)
   elif n of DBForNode[int]:
     let d = DBForNode[int](n)
+    if not d.body.isStatic: result.add(d.body.node)
+  elif n of DBForNode[NodeRow]:
+    let d = DBForNode[NodeRow](n)
     if not d.body.isStatic: result.add(d.body.node)
   elif n of DBForNode[PersonRow]:
     let d = DBForNode[PersonRow](n)
@@ -840,4 +945,34 @@ when isMainModule:
   let expertise2Wrapped = concatList(expertise2Query, expertise2Query)
   doAssert occurrences(expertise2Wrapped.node, cb).getOrDefault("field") == 0
   doAssert occurrences(expertise2Wrapped.node, linqCallbacksOpen()).getOrDefault("field") > 0
+  let xmlData = @[PlainNode(id: 0, parent: -1, name: "#doc", pre: 0, post: 13),
+    PlainNode(id: 1, parent: 0, name: "a", pre: 1, post: 12),
+    PlainNode(id: 2, parent: 1, name: "b", pre: 2, post: 5),
+    PlainNode(id: 3, parent: 2, name: "c", pre: 3, post: 4),
+    PlainNode(id: 4, parent: 1, name: "d", pre: 6, post: 11),
+    PlainNode(id: 5, parent: 4, name: "e", pre: 7, post: 8),
+    PlainNode(id: 6, parent: 4, name: "f", pre: 9, post: 10)]
+  let xp0 = PSeq(PAxis(childAxis()), PAxis(childAxis()))
+  let xp1 = PSeq(PAxis(descendantAxis()), parent())
+  let xp2 = PSeq(PAxis(descendantAxis()), Filter(PSeq(PAxis(followingSiblingAxis()), NameTest("d"))))
+  let xp3 = PSeq(PSeq(PAxis(descendantAxis()), NameTest("f")),
+    Filter(PSeq(ancestor(), PSeq(preceding(), NameTest("b")))))
+  let xps = @[xp0, xp1, xp2, xp3]
+  let xmlSource = "type NodeRow = object\n  id, parent, pre, post: int\n  name: string\ntype XmlDB = object\n  nodes: seq[NodeRow]\nlet xml = XmlDB(nodes: @[" &
+    "NodeRow(id: 0, parent: -1, name: \"#doc\", pre: 0, post: 13)," &
+    " NodeRow(id: 1, parent: 0, name: \"a\", pre: 1, post: 12)," &
+    " NodeRow(id: 2, parent: 1, name: \"b\", pre: 2, post: 5)," &
+    " NodeRow(id: 3, parent: 2, name: \"c\", pre: 3, post: 4)," &
+    " NodeRow(id: 4, parent: 1, name: \"d\", pre: 6, post: 11)," &
+    " NodeRow(id: 5, parent: 4, name: \"e\", pre: 7, post: 8)," &
+    " NodeRow(id: 6, parent: 4, name: \"f\", pre: 9, post: 10)])\n"
+  for p in xps:
+    let staged = xpath(p)
+    doAssert staged.node of DBForNode[int]
+    let expected = directXpath(p, xmlData).mapIt($it).join("\n")
+    let residual = emitInts(staged, "results", "")
+    doAssert "xml.nodes" in residual and "var exists" in residual
+    doAssert "any(" notin residual and "path(" notin residual
+    doAssert compileRun(xmlSource & "var results: seq[int] = @[]\n" & residual &
+      "for x in results: echo x\n") == expected
   echo "ok: linq staged database comprehensions, normalization, effects, and residual execution"
