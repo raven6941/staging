@@ -19,7 +19,7 @@
 ## whole normal form, and it is where rewrites belong: an
 ## `ArithExpOpt`-style rule sees `x + 0` directly instead of hunting it
 ## inside a nested tree, and CSE is a keyed dedup of the flat binding
-## list. `fromAnf` substitutes bindings back, in reverse order, so the
+## list. `fromAnf` expands each binding once, in order, so the
 ## result is again an ordinary residual tree and genlet/codegen keep
 ## working unchanged. `dceAnf` drops bindings nothing references — one
 ## backward walk, since a binding only mentions earlier bindings.
@@ -55,7 +55,7 @@
 ##   or its input unchanged; returning a composite node is a client bug
 ##   and is asserted against.
 
-import std/[tables]
+import std/[algorithm, tables]
 
 type
   AnfCallbacks*[T] = object
@@ -171,12 +171,22 @@ proc toAnf*[T](root: T; cb: AnfCallbacks[T];
   prog
 
 proc fromAnf*[T](prog: AnfProg[T]; cb: AnfCallbacks[T]): T =
-  ## Substitute bindings back, last to first, so references to later
-  ## bindings are expanded before the bindings they mention are.
-  var result = prog.result
+  ## Expand each binding once, after its earlier dependencies have been
+  ## expanded.  The old reverse walk re-substituted the growing result for
+  ## every binding, rebuilding the already expanded tree each time.
   var subst = initTable[string, T]()
-  for i in countdown(prog.stmts.high, 0):
-    var stmt = prog.stmts[i]
+  proc expand(node: T): T =
+    let name = cb.refName(node)
+    if name.len > 0 and name in subst:
+      return subst[name]
+    if cb.isAtomic(node):
+      return node
+    var kids: seq[T] = @[]
+    for child in cb.children(node):
+      kids.add(expand(child))
+    cb.rebuild(node, kids)
+  for originalStmt in prog.stmts:
+    var stmt = originalStmt
     if stmt.nested.len > 0:
       var kids: seq[T] = @[]
       let originalKids = cb.children(stmt.rhs)
@@ -186,9 +196,8 @@ proc fromAnf*[T](prog: AnfProg[T]; cb: AnfCallbacks[T]): T =
         else:
           kids.add(child)
       stmt.rhs = cb.rebuild(stmt.rhs, kids)
-    subst[stmt.name] = stmt.rhs
-    result = substRefs(result, subst, cb)
-  result
+    subst[stmt.name] = expand(stmt.rhs)
+  expand(prog.result)
 
 proc cseAnf*[T](prog: AnfProg[T]; cb: AnfCallbacks[T]): AnfProg[T] =
   ## Drop bindings whose right-hand side duplicates an earlier binding's
@@ -281,7 +290,8 @@ proc dceAnf*[T](prog: AnfProg[T]; cb: AnfCallbacks[T]): AnfProg[T] =
       for j in 0 ..< keptStmt.nested.len:
         keptStmt.nested[j] = dceAnf(keptStmt.nested[j], cb)
         markRegionOuterUses(keptStmt.nested[j], initTable[string, bool]())
-      kept.insert(keptStmt, 0)
+      kept.add(keptStmt)
+  kept.reverse()
   AnfProg[T](stmts: kept, result: prog.result)
 
 proc optAnf*[T](prog: AnfProg[T]; cb: AnfCallbacks[T];
