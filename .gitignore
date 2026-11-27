@@ -51,3 +51,4 @@ tests/test_sql_parser
 tests/test_veccomplex_arith
 tests/test_compiler
 tests/test_linq
+tests/test_scopegenlet

@@ -21,6 +21,7 @@ task test, "Run the self-tests":
   exec "nim c -r --hints:off --path:src tests/test_codegen.nim"
   exec "nim c -r --hints:off --path:src tests/test_csp.nim"
   exec "nim c -r --hints:off --path:src tests/test_genlet.nim"
+  exec "nim c -r --hints:off --path:src tests/test_scopegenlet.nim"
   exec "nim c -r --hints:off --path:src tests/test_relgenlet.nim"
   exec "nim c -r --hints:off --path:src tests/test_partial_deduction.nim"
   exec "nim c -r --hints:off --path:src tests/test_traversal.nim"
