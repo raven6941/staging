@@ -245,4 +245,15 @@ when isMainModule:
   doAssert unchanged.stmts.len == 1
   doAssert unchanged.stmts[0].nested[0].stmts.len == 1
 
+  # A nil isTotal means no LICM either (#167 decision: the conservative
+  # default stands — a nil isTotal must not default to isPure, since a
+  # pure-but-diverging binding hoisted out of a loop that never runs
+  # would change a terminating program into a diverging one).
+  var noTotal = licmCb
+  noTotal.isTotal = nil
+  let unmoved = licmAnf(toAnf(loop(mul(input("n"), lit(2))), noTotal),
+                        noTotal)
+  doAssert unmoved.stmts.len == 1
+  doAssert unmoved.stmts[0].nested[0].stmts.len == 1
+
   echo "ok: ANF conversion, ArithExpOpt rewrite, and stencil CSE"
