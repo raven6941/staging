@@ -52,6 +52,10 @@
 ## The long-term home of this classification (callbacks or a framework-level
 ## node tag) remains open; callbacks are the least invasive choice until a
 ## second consumer needs the information.
+## Totality policy: when `isTotal` is supplied, a candidate containing a
+## non-total node is not hoisted across a boundary; same-region hoisting is
+## sound. Nil `isTotal` is the lenient pure-only default and is a client
+## obligation.
 ##
 ## What this is NOT: it is not the relational genlet. The original's
 ## `RelGoal`/`RTerm` version, its `insertLetsIntoSpecs` driver over
@@ -226,6 +230,17 @@ proc callbackHoist[T](node: T; ctx: var GenletCtx;
       # A pure candidate containing an effect must never be hoisted:
       # sharing it would execute the effect fewer times.
       if containsEffect(sample[k], cb):
+        continue
+      # A pure-but-diverging candidate must not be hoisted across a
+      # boundary: it would be evaluated at definition time. Same-region
+      # hoisting is sound (the first use diverges identically). The
+      # boundary test needs the occurrence contexts, which only exist
+      # when freeVars is supplied; with freeVars nil, `occurrences`
+      # already stops at boundaries, so no cross-boundary hoist can
+      # arise and the check is vacuous there.
+      if not cb.isTotal.isNil and not cb.freeVars.isNil and
+          containsNonTotal(sample[k], cb) and
+          contexts[k].anyIt(it.len > 0):
         continue
       var scopeSafe = true
       if not cb.freeVars.isNil:

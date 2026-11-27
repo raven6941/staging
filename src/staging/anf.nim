@@ -38,7 +38,11 @@
 ##   a root — never merged by `cseAnf`, never dropped by `dceAnf` — and a
 ##   binding whose right-hand side transitively contains an effect is
 ##   likewise a root; `optAnf` never applies a rule to a binding whose
-##   nested region contains an effect. Without `isPure` the old client
+##   nested region contains an effect. When `isTotal` is supplied, a
+##   pure-but-non-total binding is also a DCE root and a nested non-total
+##   binding blocks the corresponding `optAnf` rewrite. Nil `isTotal` is the
+##   lenient pure-only default and is a client obligation, like `key` and
+##   `isPure`. Without `isPure` the old client
 ##   obligation stands: an effectful nullary node (a `read()` with no
 ##   children) must get a distinct key per occurrence, or the client must
 ##   keep it out of CSE; otherwise two reads would collapse into one.
@@ -102,6 +106,23 @@ proc effectNames[T](prog: AnfProg[T]; cb: AnfCallbacks[T]): Table[string, bool] 
       if effectNames(region, cb).len > 0: effectful = true
     if effectful: effects[stmt.name] = true
   effects
+
+proc nonTotalNames[T](prog: AnfProg[T]; cb: AnfCallbacks[T]): Table[string, bool] =
+  var nonTotals = initTable[string, bool]()
+  proc rhsNonTotal(node: T): bool =
+    if not cb.isTotal.isNil and not cb.isTotal(node): return true
+    if cb.isAtomic(node):
+      let name = cb.refName(node)
+      return name.len > 0 and name in nonTotals
+    for child in cb.children(node):
+      if rhsNonTotal(child): return true
+    false
+  for stmt in prog.stmts:
+    var nonTotal = rhsNonTotal(stmt.rhs)
+    for region in stmt.nested:
+      if nonTotalNames(region, cb).len > 0: nonTotal = true
+    if nonTotal: nonTotals[stmt.name] = true
+  nonTotals
 
 proc substRefs*[T](node: T; subst: Table[string, T];
                    cb: AnfCallbacks[T]): T =
@@ -204,6 +225,7 @@ proc dceAnf*[T](prog: AnfProg[T]; cb: AnfCallbacks[T]): AnfProg[T] =
   ## by a kept later binding.
   var used = initTable[string, bool]()
   let effects = effectNames(prog, cb)
+  let nonTotals = nonTotalNames(prog, cb)
   proc markUsed(node: T) =
     if cb.isAtomic(node):
       let name = cb.refName(node)
@@ -214,7 +236,7 @@ proc dceAnf*[T](prog: AnfProg[T]; cb: AnfCallbacks[T]): AnfProg[T] =
   var kept: seq[AnfBinding[T]] = @[]
   for i in countdown(prog.stmts.high, 0):
     let stmt = prog.stmts[i]
-    if stmt.name in used or stmt.name in effects:
+    if stmt.name in used or stmt.name in effects or stmt.name in nonTotals:
       markUsed(stmt.rhs)
       var keptStmt = stmt
       for j in 0 ..< keptStmt.nested.len:
@@ -241,10 +263,13 @@ proc optAnf*[T](prog: AnfProg[T]; cb: AnfCallbacks[T];
     # else, and dropping them would delete the effect. Pure regions
     # still rewrite (that is the point of the rule).
     var regionEffect = false
+    var regionNonTotal = false
     for region in nested:
       if effectNames(region, cb).len > 0: regionEffect = true
+      if not cb.isTotal.isNil and nonTotalNames(region, cb).len > 0:
+        regionNonTotal = true
     let rhs = substRefs(stmt.rhs, aliases, cb)
-    let rewritten = if regionEffect: rhs else: rule(rhs)
+    let rewritten = if regionEffect or regionNonTotal: rhs else: rule(rhs)
     if rewritten == rhs:
       ## `==` is identity for ref nodes and structural equality for
       ## value nodes; either way a rule returning an equal node means
