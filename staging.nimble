@@ -51,6 +51,7 @@ task test, "Run the self-tests":
   exec "nim c -r --hints:off --path:src tests/test_veccomplex_arith.nim"
   exec "nim c -r --hints:off --path:src tests/test_hoas.nim"
   exec "nim c -r --hints:off --path:src tests/test_anf.nim"
+  exec "nim c -r --hints:off --path:src tests/test_rewalk_bench.nim"
   exec "nim c -r --hints:off --path:src tests/test_compiler.nim"
   exec "nim c -r --hints:off --path:src tests/test_fun.nim"
   exec "nim c -r --hints:off --path:src tests/test_ackermann.nim"
