@@ -23,10 +23,11 @@ type
   NodeKind = enum nkInput, nkScanner, nkNext, nkNextInt, nkHasNext, nkClose,
     nkVarDecl, nkVarRead, nkVarWrite, nkSeq, nkWhile, nkIf, nkAdd, nkMul,
     nkEq, nkLt, nkLe, nkGe, nkAnd, nkOr, nkNot, nkStringLen, nkStringEq, nkStringLt, nkStringLe, nkStringGe, nkHash, nkMod, nkDiv, nkArrDecl,
-    nkArrRead, nkArrWrite, nkBufferLen, nkBufferAppend, nkBufferRead, nkInProbe, nkPrint, nkDiscard
+    nkArrRead, nkArrWrite, nkBufferLen, nkBufferAppend, nkBufferRead, nkInProbe, nkHeaderStart, nkPrint, nkDiscard
   QueryNode = ref object of IRNode
     kind: NodeKind
-    name, text: string
+    name: string
+    text: Rep[string]
     delim: char
     pos, v: Var[int]
     init, left, right, index, value: Rep[int]
@@ -42,7 +43,7 @@ type
     fields: seq[RField]
 
   Scanner = object
-    text: string
+    text: Rep[string]
     pos: Var[int]
     closed: Var[int]
   ArrayBuffer = object
@@ -78,10 +79,12 @@ type
     a*, b*: Predicate
     subquery*: Operator
   AggKind* = enum akSum, akAvg, akMin, akMax
-  OpKind* = enum okScan, okFilter, okProject, okJoin, okHashJoin, okGroup, okSort, okLimit, okOffset, okHaving, okDistinct, okPrintCSV
+  OpKind* = enum okScan, okScanFile, okFilter, okProject, okJoin, okHashJoin, okGroup, okSort, okLimit, okOffset, okHaving, okDistinct, okPrintCSV
   Operator* = ref object
     kind: OpKind
     csv, csvRight: string
+    filename: Rep[string]
+    declaredKinds: seq[bool]
     schema, outputSchema, inputSchema, keys, aggregates: seq[string]
     aggKinds: seq[AggKind]
     sortKeys: seq[string]
@@ -105,6 +108,9 @@ proc scan*(csv: string; schema: seq[string]; delim = ','): Operator =
   let header = csv.splitLines[0].split(delim)
   doAssert header.len == schema.len, "schema length does not match CSV header"
   Operator(kind: okScan, csv: csv, schema: schema, delim: delim)
+proc scanFile*(filename: Rep[string]; schema: seq[string]; kinds: seq[bool]; delim = ','): Operator =
+  doAssert kinds.len == schema.len
+  Operator(kind: okScanFile, filename: filename, schema: schema, declaredKinds: kinds, delim: delim)
 proc setSchema*(q: Operator; schema: seq[string]): Operator =
   q.schema = schema
   q
@@ -150,7 +156,7 @@ proc opShape*(q: Operator): string
 
 proc resultSchema*(q: Operator): seq[string] =
   case q.kind
-  of okScan: q.schema
+  of okScan, okScanFile: q.schema
   of okFilter, okPrintCSV: resultSchema(q.parent)
   of okProject: q.outputSchema
   of okJoin, okHashJoin: resultSchema(q.parent) & resultSchema(q.right)
@@ -182,7 +188,7 @@ proc predShape(p: Predicate): string =
 proc opShape*(q: Operator): string =
   ## A compact structural view used by the SQL front-end tests.
   case q.kind
-  of okScan: "Scan(" & q.schema.join(",") & ")"
+  of okScan, okScanFile: "Scan(" & q.schema.join(",") & ")"
   of okFilter:
     if q.predicate.kind in {pkIn, pkNotIn, pkExists, pkNotExists}: "Filter(" & predShape(q.predicate) & ";" & opShape(q.parent) & ")"
     else: "Filter(" & opShape(q.parent) & ")"
@@ -318,6 +324,7 @@ proc validateHaving(p: Predicate; q: Operator) =
 proc columnKinds(q: Operator): seq[bool] =
   case q.kind
   of okScan: result = sourceKinds(q.csv, q.schema, q.delim)
+  of okScanFile: result = q.declaredKinds
   of okFilter, okPrintCSV, okSort, okLimit, okOffset, okHaving, okDistinct: result = columnKinds(q.parent)
   of okProject:
     let parentSchema = resultSchema(q.parent)
@@ -336,6 +343,7 @@ proc columnKinds(q: Operator): seq[bool] =
 proc directRows(q: Operator): seq[seq[string]] =
   case q.kind
   of okScan: result = parseRows(q.csv, q.delim)
+  of okScanFile: result = parseRows(readFile(q.filename.staticVal), q.delim)
   of okFilter:
     let ps = resultSchema(q.parent)
     let kinds = columnKinds(q.parent)
@@ -436,7 +444,7 @@ proc directRows(q: Operator): seq[seq[string]] =
 
 # Residual constructors.  In particular, Scanner position is a residual Var,
 # and effectful scanner nodes are never pure/merged by genlet.
-proc scannerNew(text: string): Scanner =
+proc scannerNew(text: Rep[string]): Scanner =
   ## The name is residual state, so two scans can coexist in a join.
   var serial {.global.}: int
   let suffix = if serial == 0: "" else: $serial
@@ -444,6 +452,7 @@ proc scannerNew(text: string): Scanner =
   result.text = text
   result.pos = newVar(staticInt(0), proc(x: Rep[int]): IRNode = QueryNode(kind: nkVarDecl, name: "scannerPos" & suffix, init: x))
   result.closed = newVar(staticInt(0), proc(x: Rep[int]): IRNode = QueryNode(kind: nkVarDecl, name: "scannerClosed" & suffix, init: x))
+proc scannerNew(text: string): Scanner = scannerNew(staticString(text))
 proc scannerNext(s: Scanner; d: char): Rep[string] = dynamic[string](QueryNode(kind: nkNext, text: s.text, delim: d, pos: s.pos))
 proc scannerNextInt(s: Scanner; d: char): Rep[int] = dynamic[int](QueryNode(kind: nkNextInt, text: s.text, delim: d, pos: s.pos))
 proc scannerHasNext(s: Scanner): Rep[bool] = dynamic[bool](QueryNode(kind: nkHasNext, text: s.text, pos: s.pos))
@@ -477,11 +486,12 @@ proc emitInt(x: Rep[int]): string =
   if x.isStatic: return $x.staticVal
   let n = QueryNode(x.node)
   case n.kind
-  of nkNextInt: "parseInt(scannerNext(" & escape(n.text) & ", " & QueryNode(n.pos.node).name & ", " & repr(n.delim) & "))"
+  of nkNextInt: "parseInt(scannerNext(" & emitString(n.text) & ", " & QueryNode(n.pos.node).name & ", " & repr(n.delim) & "))"
   of nkAdd: "(" & emitInt(n.left) & " + " & emitInt(n.right) & ")"
   of nkMul: "(" & emitInt(n.left) & " * " & emitInt(n.right) & ")"
   of nkMod: "(" & emitInt(n.left) & " mod " & emitInt(n.right) & ")"
   of nkDiv: "(" & emitInt(n.left) & " div " & emitInt(n.right) & ")"
+  of nkHeaderStart: emitString(n.text) & ".find('\\n') + 1"
   of nkHash: "hashString(" & emitString(n.sleft) & ")"
   of nkBufferRead: QueryNode(n.arr.node).name & "[" & emitInt(n.index) & "]"
   of nkArrRead: QueryNode(n.arr.node).name & "[" & emitInt(n.index) & "]"
@@ -492,14 +502,15 @@ proc emitString(x: Rep[string]): string =
   if x.isStatic: return escape(x.staticVal)
   let n = QueryNode(x.node)
   case n.kind
-  of nkNext: "scannerNext(" & escape(n.text) & ", " & QueryNode(n.pos.node).name & ", " & repr(n.delim) & ")"
+  of nkInput: n.name
+  of nkNext: "scannerNext(" & emitString(n.text) & ", " & QueryNode(n.pos.node).name & ", " & repr(n.delim) & ")"
   of nkBufferRead: QueryNode(n.arrStr.node).name & "[" & emitInt(n.index) & "]"
   of nkArrRead: QueryNode(n.arrStr.node).name & "[" & emitInt(n.index) & "]"
   else: raise newException(ValueError, "bad residual string")
 proc emitBool(x: Rep[bool]): string =
   if x.isStatic: return $x.staticVal
   let n = QueryNode(x.node)
-  if n.kind == nkHasNext: QueryNode(n.pos.node).name & " < " & escape(n.text) & ".len"
+  if n.kind == nkHasNext: QueryNode(n.pos.node).name & " < " & emitString(n.text) & ".len"
   elif n.kind == nkStringEq: "compareStringChars(" & emitString(n.sleft) & ", " & emitString(n.sright) & ")"
   elif n.kind == nkStringLt: "compareStringLt(" & emitString(n.sleft) & ", " & emitString(n.sright) & ")"
   elif n.kind == nkStringLe: "compareStringLe(" & emitString(n.sleft) & ", " & emitString(n.sright) & ")"
@@ -542,14 +553,21 @@ proc emitStmt(x: Rep[Unit]; ind=""): string =
     else: ind & QueryNode(n.arr.node).name & "[" & emitInt(n.index) & "] = " & emitInt(n.value)
   else: ind & "discard"
 
-proc compileRun(source, exe, dir: string): string =
+proc compileRun(source, exe, dir: string; args = ""): string =
   let nim = findExe("nim")
   doAssert nim.len > 0, "nim compiler not found"
   let c = execCmdEx(quoteShell(nim) & " c --hints:off --nimcache:" & quoteShell(dir/"nimcache") & " --out:" & quoteShell(exe) & " " & quoteShell(source), {poUsePath,poStdErrToStdOut}, workingDir=dir)
   doAssert c.exitCode == 0, c.output
-  let r = execCmdEx(quoteShell(exe), {poUsePath,poStdErrToStdOut}, workingDir=dir)
+  let r = execCmdEx(quoteShell(exe) & (if args.len == 0: "" else: " " & quoteShell(args)), {poUsePath,poStdErrToStdOut}, workingDir=dir)
   doAssert r.exitCode == 0, r.output
   r.output.strip
+
+proc hasRuntimeScan(q: Operator): bool =
+  case q.kind
+  of okScanFile: true
+  of okFilter, okProject, okSort, okLimit, okOffset, okHaving, okDistinct, okPrintCSV: hasRuntimeScan(q.parent)
+  of okJoin, okHashJoin: hasRuntimeScan(q.parent) or hasRuntimeScan(q.right)
+  else: false
 
 proc ifB(c: Rep[bool]; t, e: proc(): Rep[Unit]): Rep[Unit] =
   smartIf(c, t, e, proc(x:Rep[bool]; a,b:Rep[Unit]):IRNode=QueryNode(kind:nkIf,cond:x,thenB:a,elseB:b))
@@ -594,19 +612,26 @@ proc execOpWith(q: Operator; emitRow: proc(f: seq[RField]): Rep[Unit];
   proc discardFields(xs: seq[RField]): Rep[Unit] = dynamic[Unit](QueryNode(kind:nkDiscard,fields:xs))
   proc addMany(xs: seq[Rep[Unit]]): Rep[Unit] = seqMany(xs)
   proc stringCols(csv: string; schema: seq[string]): seq[bool] =
-    let delim = if q.kind == okScan: q.delim else: q.parent.delim
-    sourceKinds(csv, schema, delim)
+    if q.kind == okScanFile: q.declaredKinds
+    else:
+      let delim = if q.kind == okScan: q.delim else: q.parent.delim
+      sourceKinds(csv, schema, delim)
   proc row(sc: Scanner; csv: string; schema: seq[string]; kinds: seq[bool]; delim: char): seq[RField] =
     for i in 0 ..< schema.len:
       let d = if i == schema.high: '\n' else: delim
       if kinds[i]: result.add(RField(kind:fkString,str:RString(data:scannerNext(sc,d))))
       else: result.add(RField(kind:fkInt,int:RInt(value:scannerNextInt(sc,d))))
-  proc scanRows(csv: string; schema: seq[string]; kinds: seq[bool]; delim: char; emitRow: proc(f: seq[RField]): Rep[Unit]): Rep[Unit] =
-    let sc = scannerNew(csv)
+  proc scanRows(text: Rep[string]; schema: seq[string]; kinds: seq[bool]; delim: char; emitRow: proc(f: seq[RField]): Rep[Unit]): Rep[Unit] =
+    let sc = scannerNew(text)
     vars.add(sc.pos)
-    let start = vw(sc.pos, staticInt(csv.find('\n') + 1))
-    let loop = whileLoop(proc():Rep[bool]=scannerHasNext(sc), proc():Rep[Unit]=emitRow(row(sc,csv,schema,kinds,delim)))
+    let start = if text.isStatic:
+      vw(sc.pos, staticInt(text.staticVal.find('\n') + 1))
+    else:
+      vw(sc.pos, dynamic[int](QueryNode(kind: nkHeaderStart, text: text)))
+    let loop = whileLoop(proc():Rep[bool]=scannerHasNext(sc), proc():Rep[Unit]=emitRow(row(sc,"",schema,kinds,delim)))
     seqs(start, loop)
+  proc scanRows(csv: string; schema: seq[string]; kinds: seq[bool]; delim: char; emitRow: proc(f: seq[RField]): Rep[Unit]): Rep[Unit] =
+    scanRows(staticString(csv), schema, kinds, delim, emitRow)
   var inPreds: seq[Predicate] = @[]
   var inS: seq[Arr[string]] = @[]
   var inI: seq[Arr[int]] = @[]
@@ -672,7 +697,59 @@ proc execOpWith(q: Operator; emitRow: proc(f: seq[RField]): Rep[Unit];
       let probe = ltI(staticInt(0), vr(inUsed[j]))
       result = dynamic[bool](QueryNode(kind: nkNot, boolA: probe))
   var body: Rep[Unit]
-  if q.kind == okLimit:
+  if q.kind == okFilter and hasRuntimeScan(q.parent):
+    let schema = resultSchema(q.parent)
+    let kinds = columnKinds(q.parent)
+    let pos = iv("runtimeFilterPos")
+    var bs: seq[Arr[string]] = @[]
+    var bi: seq[Arr[int]] = @[]
+    for i in 0 ..< schema.len:
+      if kinds[i]: bs.add(sa("runtimeFilterS" & $i))
+      else: bi.add(ia("runtimeFilterI" & $i))
+    var parentBody: Rep[Unit]
+    discard execOpWith(q.parent,
+      proc(f: seq[RField]): Rep[Unit] =
+        var writes: seq[Rep[Unit]] = @[]; var si = 0; var ii = 0
+        for i in 0 ..< schema.len:
+          if kinds[i]: writes.add(sw(bs[si], vr(pos), f[i].str.data)); inc si
+          else: writes.add(aw(bi[ii], vr(pos), f[i].int.value)); inc ii
+        var loaded: seq[RField] = @[]; si = 0; ii = 0
+        for i in 0 ..< schema.len:
+          if kinds[i]: loaded.add(RField(kind: fkString, str: RString(data: sr(bs[si], vr(pos))))); inc si
+          else: loaded.add(RField(kind: fkInt, int: RInt(value: ar(bi[ii], vr(pos))))); inc ii
+        let same = predicateRep(q.predicate, loaded, schema, kinds)
+        seqs(addMany(writes), seqs(ifB(same,
+          proc(): Rep[Unit] = emitRow(loaded),
+          proc(): Rep[Unit] = unit()), vw(pos, intAdd(vr(pos), staticInt(1))))),
+      vars, ints, strings, parentBody, false)
+    body = parentBody
+  elif q.kind == okProject and hasRuntimeScan(q.parent):
+    let schema = resultSchema(q.parent)
+    let kinds = columnKinds(q.parent)
+    let input = if q.inputSchema.len == 0: q.outputSchema else: q.inputSchema
+    let pos = iv("runtimeProjectPos")
+    var bs: seq[Arr[string]] = @[]
+    var bi: seq[Arr[int]] = @[]
+    for i in 0 ..< schema.len:
+      if kinds[i]: bs.add(sa("runtimeProjectS" & $i))
+      else: bi.add(ia("runtimeProjectI" & $i))
+    var parentBody: Rep[Unit]
+    discard execOpWith(q.parent,
+      proc(f: seq[RField]): Rep[Unit] =
+        var writes: seq[Rep[Unit]] = @[]; var si = 0; var ii = 0
+        for i in 0 ..< schema.len:
+          if kinds[i]: writes.add(sw(bs[si], vr(pos), f[i].str.data)); inc si
+          else: writes.add(aw(bi[ii], vr(pos), f[i].int.value)); inc ii
+        var loaded: seq[RField] = @[]; si = 0; ii = 0
+        for i in 0 ..< schema.len:
+          if kinds[i]: loaded.add(RField(kind: fkString, str: RString(data: sr(bs[si], vr(pos))))); inc si
+          else: loaded.add(RField(kind: fkInt, int: RInt(value: ar(bi[ii], vr(pos))))); inc ii
+        var selected: seq[RField] = @[]
+        for name in input: selected.add(loaded[lookup(schema, name)])
+        seqs(addMany(writes), seqs(emitRow(selected), vw(pos, intAdd(vr(pos), staticInt(1))))),
+      vars, ints, strings, parentBody, false)
+    body = parentBody
+  elif q.kind == okLimit:
     let count = iv("limitCount")
     proc wrappedEmitRow(f: seq[RField]): Rep[Unit] =
       ifB(ltI(vr(count), staticInt(q.n)),
@@ -1168,11 +1245,13 @@ proc execOpWith(q: Operator; emitRow: proc(f: seq[RField]): Rep[Unit];
             same = andB(same,eq)
         ifB(same, proc():Rep[Unit]=emitRow(left & right), proc():Rep[Unit]=unit())))
   else:
-    let schema = resultSchema(if q.kind == okScan: q else: q.parent)
-    let csv = if q.kind == okScan: q.csv else: q.parent.csv
-    let kinds=stringCols(csv,schema)
-    body=scanRows(csv,schema,kinds,if q.kind == okScan: q.delim else: q.parent.delim,proc(f: seq[RField]):Rep[Unit]=emitRow(f))
+    let source = if q.kind in {okScan, okScanFile}: q else: q.parent
+    let schema = resultSchema(source)
+    let kinds = columnKinds(source)
+    let text = if source.kind == okScanFile: dynamic[string](QueryNode(kind: nkInput, name: "csvText")) else: staticString(source.csv)
+    body=scanRows(text,schema,kinds,source.delim,proc(f: seq[RField]):Rep[Unit]=emitRow(f))
   result = "import std/strutils\n\nproc compareStringChars(a,b: string): bool =\n  var i = 0\n  result = a.len == b.len\n  while result and i < a.len:\n    result = a[i] == b[i]\n    inc i\n\nproc hashString(a: string): int =\n  var i = 0\n  result = 0\n  while i < a.len:\n    result = result * 41 + ord(a[i])\n    inc i\n\nproc scannerNext(text: string; pos: var int; delim: char): string =\n  let start = pos\n  var stop = pos\n  while stop < text.len and text[stop] != delim: inc stop\n  result = text[start ..< stop]\n  if stop < text.len: inc stop\n  pos = stop\n\n"
+  if hasRuntimeScan(q): result = "import std/os\nlet csvText = readFile(paramStr(1))\n" & result
   result = result.replace("proc compareStringChars(a,b: string): bool =", "proc inString(x: string; a: seq[string]; n: int): bool =\n  var i = 0\n  while i < n:\n    if x == a[i]: return true\n    inc i\n  false\n\nproc inInt(x: int; a: seq[int]; n: int): bool =\n  var i = 0\n  while i < n:\n    if x == a[i]: return true\n    inc i\n  false\n\nproc compareStringChars(a,b: string): bool =")
   bodyOut = body
   sharedVars = vars
@@ -1199,6 +1278,12 @@ proc runStaged*(q: Operator): seq[string] =
   if outputText.len > 0: result=outputText.splitLines
   removeDir(d)
 
+proc runStagedFile*(q: Operator; path: string): seq[string] =
+  let d = getTempDir()/"query-optc-file"; createDir(d)
+  let src=d/"residual.nim"; writeFile(src, execOp(q)); let outputText=compileRun(src,d/"residual",d,path)
+  if outputText.len > 0: result=outputText.splitLines
+  removeDir(d)
+
 proc runBufferRoundTrip(): string =
   let d = getTempDir()/"query-optc-buffer"; createDir(d)
   let b = ArrayBuffer(ints: newArray[int](staticInt(4), proc(n:Rep[int]):IRNode=QueryNode(kind:nkArrDecl,name:"bufferInts",init:n)), strings: newArray[string](staticInt(4), proc(n:Rep[int]):IRNode=QueryNode(kind:nkArrDecl,name:"bufferStrings",init:n)), len:newVar(staticInt(0),proc(n:Rep[int]):IRNode=QueryNode(kind:nkVarDecl,name:"bufferLen",init:n)))
@@ -1215,6 +1300,22 @@ when isMainModule:
   let expected = directRows(q).mapIt(it.join(","))
   let scanQ = scan(csv, @["name", "amount"])
   doAssert runStaged(scanQ) == directRows(scanQ).mapIt(it.join(","))
+  let fileA = getTempDir()/"query-optc-file-a.csv"
+  let fileB = getTempDir()/"query-optc-file-b.csv"
+  writeFile(fileA, "name,amount\nAda,10\nBakedA,99\n")
+  writeFile(fileB, "name,amount\nRuntimeB,20\nCara,7\n")
+  let fileQ = project(@["name"], filter(greaterThan(field("amount"), intValue(8)),
+    scanFile(staticString(fileA), @["name", "amount"], @[true, false])))
+  let fileResidual = execOp(fileQ)
+  doAssert "readFile(" in fileResidual
+  doAssert "BakedA" notin fileResidual and "RuntimeB" notin fileResidual
+  doAssert "while stop < text.len" in fileResidual
+  let fileExpectedA = directRows(fileQ).mapIt(it.join(","))
+  doAssert runStagedFile(fileQ, fileA) == fileExpectedA
+  let fileExpectedB = parseRows(readFile(fileB)).filterIt(parseInt(it[1]) > 8).mapIt(it[0])
+  doAssert runStagedFile(fileQ, fileB) == fileExpectedB
+  doAssert fileExpectedA != fileExpectedB
+  removeFile(fileA); removeFile(fileB)
   let residual = execOp(q)
   doAssert "newSeq[string]" in residual
   doAssert "hashString(" in residual and residual.count("hashString(") > 1
