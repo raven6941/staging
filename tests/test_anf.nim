@@ -196,6 +196,22 @@ when isMainModule:
   doAssert moved.stmts[1].nested[0].stmts.len == 1
   doAssert evalExpr(fromAnf(moved, licmCb), {"a": 3, "n": 4}.toTable) == 11
 
+  # LICM splices every invariant binding before the loop, in original order,
+  # without duplicating them or reordering the surrounding bindings.
+  let multiHoist = toAnf(
+    add(loop(add(mul(input("n"), lit(2)), add(input("a"), lit(1)))),
+        input("b")), licmCb)
+  let multiMoved = licmAnf(multiHoist, licmCb)
+  doAssert multiMoved.stmts.len == 4
+  doAssert multiMoved.stmts[0].rhs.kind == ekMul
+  doAssert multiMoved.stmts[1].rhs.kind == ekAdd
+  doAssert multiMoved.stmts[2].rhs.kind == ekLoop
+  doAssert multiMoved.stmts[2].nested[0].stmts.len == 1
+  doAssert multiMoved.stmts[2].nested[0].stmts[0].rhs.kind == ekAdd
+  doAssert multiMoved.stmts[3].rhs.kind == ekAdd
+  doAssert evalExpr(fromAnf(multiMoved, licmCb),
+                    {"a": 3, "b": 5, "n": 4}.toTable) == 17
+
   # A loop binder, a mutable/read binding, an effect, and a non-total node
   # each prevent motion. The read dependency also checks transitivity.
   let boundBody = licmAnf(
