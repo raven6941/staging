@@ -307,10 +307,12 @@ proc licmAnf*[T](prog: AnfProg[T]; cb: AnfCallbacks[T]): AnfProg[T] =
   while i < outProg.stmts.len:
     var stmt = outProg.stmts[i]
     var movedBefore: seq[AnfBinding[T]] = @[]
+    var inserted = 0
     for j in 0 ..< stmt.nested.len:
       stmt.nested[j] = licmAnf(stmt.nested[j], cb)
       let moved = hoistRegion(stmt.nested[j], stmt.rhs)
       if moved.len > 0:
+        inserted += moved.len
         var retained: seq[AnfBinding[T]] = @[]
         for candidate in stmt.nested[j].stmts:
           var keep = true
@@ -323,6 +325,6 @@ proc licmAnf*[T](prog: AnfProg[T]; cb: AnfCallbacks[T]): AnfProg[T] =
     if movedBefore.len > 0:
       for k in countdown(movedBefore.high, 0):
         outProg.stmts.insert(movedBefore[k], i)
-      i += movedBefore.len
+      i += inserted
     inc i
   outProg
