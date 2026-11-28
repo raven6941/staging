@@ -6,9 +6,12 @@
 ## theoretical counterpoint into numbers: it times the documented ANF pass
 ## pipeline (toAnf -> cseAnf -> licmAnf -> dceAnf -> fromAnf) against
 ## residual size, on the ANF test DSL (the only node type with full ANF
-## callbacks), in three shapes — a deep chain, a balanced tree, and a
-## loop-nested body — plus construction time for the same residual, so the
+## callbacks), in four shapes — a deep chain, a balanced tree, a hoist-free
+## loop-nested body, and a loop-nested body with hoisting — plus construction
+## time for the same residual, so the
 ## re-walk share is visible separately from staging/construction time.
+## The loop-hoist shape exercises the hoist path at scale; the loop shape
+## remains the scan-cost control.
 ##
 ## Threshold, named BEFORE measuring (post-hoc verdicts are not allowed):
 ## trigger 1 FIRES iff either (a) at some N <= 10_000 bindings, total
@@ -140,13 +143,20 @@ proc buildBalanced(leaves: int; lo = 0): Expr =
 proc buildLoop(n: int): Expr =
   ## N-op chain over the loop binder inside a loop body. Every op mentions
   ## the binder, so licmAnf moves nothing (the scan cost is what is
-  ## measured) — a hoisting body cannot go through the full pipeline here:
-  ## dceAnf after licmAnf drops hoisted bindings (#178), so the loop shape
-  ## deliberately stays hoist-free until that is fixed.
+  ## measured). This remains the hoist-free scan-cost control; the adjacent
+  ## buildLoopHoist shape exercises the fixed hoisting path.
   var body = refE("i")
   for i in 1 .. n:
     body = add(body, lit(1))
   loop(body)
+
+proc buildLoopHoist(n: int): Expr =
+  ## The shared invariant is CSE'd once, then LICM hoists it out of the loop.
+  var chain = refE("i")
+  for i in 1 .. n:
+    chain = add(chain, lit(1))
+  let inv = mul(input("a"), lit(7))
+  loop(add(add(chain, inv), inv))
 
 proc median3(times: array[3, float]): float =
   var t = @[times[0], times[1], times[2]]
@@ -166,8 +176,10 @@ proc timeIt(reps: int; body: proc()): float =
 proc runRow(shape: string; n: int; build: proc(): Expr) =
   let probe = build()
   let nodes = countNodes(probe)
-  let bindings = toAnf(probe, cb).stmts.len +
-    (if shape == "loop": toAnf(probe, cb).stmts[0].nested[0].stmts.len else: 0)
+  let probeAnf = toAnf(probe, cb)
+  let bindings = probeAnf.stmts.len +
+    (if shape == "loop" or shape == "loop-hoist":
+      probeAnf.stmts[0].nested[0].stmts.len else: 0)
   # Correctness at this size: the pipeline round-trips the value.
   var env = {"x": 0, "a": 3, "n": 4, "i": 5}.toTable
   for i in 0 ..< n:
@@ -183,8 +195,26 @@ proc runRow(shape: string; n: int; build: proc(): Expr) =
   let csed = cseAnf(anf, cb)
   let tLicm = timeIt(3, proc() = discard licmAnf(csed, cb))
   let licmed = licmAnf(csed, cb)
+  if shape == "loop-hoist":
+    let invariantKey = "mul(in(a),lit(7))"
+    var invariantAt = -1
+    var loopAt = -1
+    for i, stmt in licmed.stmts:
+      if cb.key(stmt.rhs) == invariantKey: invariantAt = i
+      if stmt.nested.len == 1 and cb.isBoundary(stmt.rhs): loopAt = i
+    doAssert invariantAt >= 0 and loopAt >= 0 and invariantAt < loopAt,
+      "loop-hoist LICM did not place invariant before loop"
+    var inLoop = false
+    for stmt in licmed.stmts[loopAt].nested[0].stmts:
+      if cb.key(stmt.rhs) == invariantKey: inLoop = true
+    doAssert not inLoop, "loop-hoist LICM left invariant in loop region"
   let tDce = timeIt(3, proc() = discard dceAnf(licmed, cb))
   let dced = dceAnf(licmed, cb)
+  if shape == "loop-hoist":
+    var survived = false
+    for stmt in dced.stmts:
+      if cb.key(stmt.rhs) == "mul(in(a),lit(7))": survived = true
+    doAssert survived, "loop-hoist DCE dropped hoisted invariant"
   let tFrom = timeIt(3, proc() = discard fromAnf(dced, cb))
   let tPass = tToAnf + tCse + tLicm + tDce + tFrom
   let ratio = if tBuild > 0: tPass / tBuild else: 0.0
@@ -205,14 +235,18 @@ when isMainModule:
     const chainNs = [100, 300, 1000, 3000, 5000]
     const balNs = [100, 300, 1000, 3000, 10000]
     const loopNs = [100, 300, 1000, 3000, 5000]
+    const loopHoistNs = [100, 300, 1000, 3000, 5000]
   else:
     const chainNs = [100, 300]
     const balNs = [100, 300]
     const loopNs = [100, 300]
+    const loopHoistNs = [100, 300]
   for n in chainNs:
     runRow("chain", n, proc(): Expr = buildChain(n))
   for n in balNs:
     runRow("balanced", n, proc(): Expr = buildBalanced(n))
   for n in loopNs:
     runRow("loop", n, proc(): Expr = buildLoop(n))
+  for n in loopHoistNs:
+    runRow("loop-hoist", n, proc(): Expr = buildLoopHoist(n))
   echo "ok: re-walk bench (threshold in header; see #177)"
